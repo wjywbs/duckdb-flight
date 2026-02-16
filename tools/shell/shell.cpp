@@ -2988,6 +2988,18 @@ static void linenoise_completion(const char *zLine, linenoiseCompletions *lc) {
 }
 #endif
 
+static bool arg_is_unsigned_integer(const char *arg) {
+	if (!arg || !arg[0]) {
+		return false;
+	}
+	for (idx_t i = 0; arg[i]; i++) {
+		if (!ShellState::IsDigit(arg[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 struct CommandLineCall {
 	CommandLineCall(const CommandLineOption &option, vector<string> arguments_p)
 	    : option(option), arguments(std::move(arguments_p)) {
@@ -3147,6 +3159,9 @@ int RunShell(int argc, const char **argv) {
 				data.PrintDatabaseError(error);
 				return 1;
 			}
+			arguments.emplace_back(argv[++i]);
+		}
+		if (strcmp(option.option, "flight-sql") == 0 && i + 1 < argc && arg_is_unsigned_integer(argv[i + 1])) {
 			arguments.emplace_back(argv[++i]);
 		}
 		if (option.pre_init_callback) {
