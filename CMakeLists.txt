@@ -1287,6 +1287,9 @@ foreach(EXT IN LISTS BUILD_EXTENSIONS)
     if (EXISTS "${EXTENSION_CONFIG_BASE_DIR}/${EXT}.cmake")
       # out-of-tree extension: load cmake file
       include("${EXTENSION_CONFIG_BASE_DIR}/${EXT}.cmake")
+    elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extension/${EXT}/extension_config.cmake")
+      # in-tree extension with custom config
+      include("${CMAKE_CURRENT_SOURCE_DIR}/extension/${EXT}/extension_config.cmake")
     else()
       # in-tree or non-existent extension: load it
       duckdb_extension_load(${EXT})

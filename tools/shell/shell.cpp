@@ -78,6 +78,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <assert.h>
 #include "duckdb_shell_wrapper.h"
 #include "duckdb/common/box_renderer.hpp"
@@ -106,6 +107,8 @@ typedef unsigned char u8;
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <chrono>
+#include <thread>
 
 #if HAVE_READLINE
 #include <readline/readline.h>
@@ -4744,6 +4747,7 @@ static const char zOptions[] =
     "   -csv                 set output mode to 'csv'\n"
     "   -echo                print commands before execution\n"
     "   -f FILENAME          read/process named file and exit\n"
+    "   -flight-sql [PORT]   starts Arrow Flight SQL server and runs as daemon mode\n"
     "   -init FILENAME       read/process named file\n"
     "   -[no]header          turn headers on or off\n"
     "   -help                show this message\n"
@@ -4826,6 +4830,48 @@ static char *cmdline_option_value(int argc, char **argv, int i) {
 	return argv[i];
 }
 
+static bool arg_is_unsigned_integer(const char *arg) {
+	if (!arg || !arg[0]) {
+		return false;
+	}
+	for (size_t i = 0; arg[i]; i++) {
+		if (!IsDigit(arg[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool parse_port_arg(const char *arg, uint16_t &port) {
+	if (!arg_is_unsigned_integer(arg)) {
+		return false;
+	}
+	errno = 0;
+	char *end_ptr = nullptr;
+	auto parsed = strtoull(arg, &end_ptr, 10);
+	if (errno != 0 || end_ptr == nullptr || *end_ptr != '\0' || parsed > 65535ULL) {
+		return false;
+	}
+	port = static_cast<uint16_t>(parsed);
+	return true;
+}
+
+static std::string sql_escape_literal(const std::string &value) {
+	return duckdb::StringUtil::Replace(value, "'", "''");
+}
+
+static std::string fallback_flight_extension_path(const char *argv0) {
+	if (!argv0) {
+		return "";
+	}
+	std::string binary_path(argv0);
+	auto slash_pos = binary_path.find_last_of("/\\");
+	if (slash_pos == std::string::npos) {
+		return "extension/flight/flight.duckdb_extension";
+	}
+	return binary_path.substr(0, slash_pos + 1) + "extension/flight/flight.duckdb_extension";
+}
+
 #ifndef SQLITE_SHELL_IS_UTF8
 #if (defined(_WIN32) || defined(WIN32)) && defined(_MSC_VER)
 #define SQLITE_SHELL_IS_UTF8 (0)
@@ -4847,6 +4893,8 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv) {
 	int rc = 0;
 	bool warnInmemoryDb = false;
 	bool readStdin = true;
+	bool flight_sql_mode = false;
+	uint16_t flight_sql_port = 12345;
 	int nCmd = 0;
 	char **azCmd = nullptr;
 #if !SQLITE_SHELL_IS_UTF8
@@ -4983,6 +5031,17 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv) {
 			}
 		} else if (strcmp(z, "-bail") == 0) {
 			bail_on_error = true;
+		} else if (strcmp(z, "-flight-sql") == 0) {
+			flight_sql_mode = true;
+			readStdin = false;
+			data.openFlags |= DUCKDB_UNSIGNED_EXTENSIONS;
+			if (i + 1 < argc && arg_is_unsigned_integer(argv[i + 1])) {
+				if (!parse_port_arg(argv[i + 1], flight_sql_port)) {
+					utf8_printf(stderr, "%s: Error: invalid port for -flight-sql: %s\n", program_name, argv[i + 1]);
+					return 1;
+				}
+				i++;
+			}
 		}
 	}
 	verify_uninitialized();
@@ -5148,6 +5207,30 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv) {
 				free(azCmd);
 				return rc;
 			}
+		} else if (strcmp(z, "-flight-sql") == 0) {
+			if (i + 1 < argc && arg_is_unsigned_integer(argv[i + 1])) {
+				if (!parse_port_arg(argv[i + 1], flight_sql_port)) {
+					utf8_printf(stderr, "%s: Error: invalid port for -flight-sql: %s\n", program_name, argv[i + 1]);
+					free(azCmd);
+					return 1;
+				}
+				i++;
+			}
+			auto extension_path = fallback_flight_extension_path(argv[0]);
+			if (!extension_path.empty() && access(extension_path.c_str(), 0) == 0) {
+				auto fallback_cmd = duckdb::StringUtil::Format(
+				    "LOAD '%s'; CALL start_flight_sql_server(CAST(%d AS USMALLINT))", sql_escape_literal(extension_path),
+				    flight_sql_port);
+				rc = data.RunInitialCommand((char *)fallback_cmd.c_str(), true);
+			} else {
+				std::string cmd =
+				    duckdb::StringUtil::Format("%s(CAST(%d AS USMALLINT))", data.flight_sql_command, flight_sql_port);
+				rc = data.RunInitialCommand((char *)cmd.c_str(), true);
+			}
+			if (rc != 0) {
+				free(azCmd);
+				return rc;
+			}
 		} else if (strcmp(z, "-storage_version") == 0) {
 			// already processed on start-up
 		} else {
@@ -5157,6 +5240,15 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv) {
 			return 1;
 		}
 		data.cMode = data.mode;
+	}
+
+	if (flight_sql_mode) {
+		while (!seenInterrupt) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+		(void)data.RunInitialCommand((char *)"CALL stop_flight_sql_server()", false);
+		free(azCmd);
+		return 0;
 	}
 
 	if (!readStdin) {
