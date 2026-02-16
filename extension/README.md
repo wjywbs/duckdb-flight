@@ -41,7 +41,7 @@ in DuckDB with various
 The simplest way to specify which extensions to load is using the `DUCKDB_EXTENSIONS` variable. To specify which extensions
 to build when making duckdb set the extensions variable to a `;` separated list of extensions names. For example:
 ```bash
-DUCKDB_EXTENSIONS='json;icu;flight' make
+DUCKDB_EXTENSIONS='json;icu' make
 ```
 The `DUCKDB_EXTENSIONS` variable is simply passed to a CMake variable `BUILD_EXTENSIONS` which can also be invoked directly:
 ```bash
