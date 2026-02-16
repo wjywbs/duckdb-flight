@@ -199,6 +199,12 @@ public:
 	LargeNumberRendering large_number_rendering = LargeNumberRendering::DEFAULT;
 	//! The command to execute when `-ui` is passed in
 	string ui_command = "CALL start_ui()";
+	//! The command prefix to execute when `-flight-sql` is passed in
+	string flight_sql_command = "LOAD flight; CALL start_flight_sql_server";
+	//! Whether or not Flight SQL daemon mode is enabled from the command line
+	bool flight_sql_mode = false;
+	//! Port used by Flight SQL daemon mode
+	uint16_t flight_sql_port = 12345;
 	idx_t last_changes = 0;
 	idx_t total_changes = 0;
 	bool readStdin = true;

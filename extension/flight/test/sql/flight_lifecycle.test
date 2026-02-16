@@ -1,0 +1,32 @@
+# name: extension/flight/test/sql/flight_lifecycle.test
+# description: test flight extension lifecycle table functions
+# group: [flight]
+
+require flight
+
+statement ok
+CALL start_flight_sql_server(CAST(0 AS USMALLINT))
+
+query I
+SELECT * FROM flight_sql_is_started()
+----
+1
+
+query I
+SELECT length(status) > 0 FROM get_flight_sql_url()
+----
+1
+
+statement ok
+CALL start_flight_sql_server(CAST(0 AS USMALLINT))
+
+statement ok
+CALL stop_flight_sql_server()
+
+query I
+SELECT * FROM flight_sql_is_started()
+----
+0
+
+statement ok
+CALL stop_flight_sql_server()

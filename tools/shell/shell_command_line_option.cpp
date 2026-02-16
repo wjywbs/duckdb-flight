@@ -1,5 +1,8 @@
 #include "shell_state.hpp"
 #include "shell_highlight.hpp"
+#include "duckdb/common/local_file_system.hpp"
+#include <cerrno>
+#include <cstdlib>
 
 namespace duckdb_shell {
 
@@ -93,6 +96,72 @@ MetadataResult LaunchUI(ShellState &state, const vector<string> &args) {
 	return MetadataResult::SUCCESS;
 }
 
+static bool ParsePortArg(const string &arg, uint16_t &port) {
+	errno = 0;
+	char *end_ptr = nullptr;
+	auto parsed = std::strtoull(arg.c_str(), &end_ptr, 10);
+	if (errno != 0 || end_ptr == nullptr || *end_ptr != '\0' || parsed > 65535ULL) {
+		return false;
+	}
+	port = static_cast<uint16_t>(parsed);
+	return true;
+}
+
+static string SQLEscapeLiteral(const string &value) {
+	return StringUtil::Replace(value, "'", "''");
+}
+
+static string FallbackFlightExtensionPath(const char *argv0) {
+	if (!argv0) {
+		return "";
+	}
+	string binary_path(argv0);
+	auto slash_pos = binary_path.find_last_of("/\\");
+	if (slash_pos == string::npos) {
+		return "extension/flight/flight.duckdb_extension";
+	}
+	return binary_path.substr(0, slash_pos + 1) + "extension/flight/flight.duckdb_extension";
+}
+
+MetadataResult EnableFlightSQLMode(ShellState &state, const vector<string> &args) {
+	state.readStdin = false;
+	state.flight_sql_mode = true;
+	state.config.SetOptionByName("allow_unsigned_extensions", true);
+	state.flight_sql_port = 12345;
+	if (args.size() > 1 && !ParsePortArg(args[1], state.flight_sql_port)) {
+		state.PrintF(PrintOutput::STDERR, "%s: Error: invalid port for -flight-sql: %s\n", state.program_name,
+		             args[1].c_str());
+		exit(1);
+		return MetadataResult::EXIT;
+	}
+	return MetadataResult::SUCCESS;
+}
+
+MetadataResult LaunchFlightSQL(ShellState &state, const vector<string> &args) {
+	duckdb::LocalFileSystem lfs;
+	auto extension_path = FallbackFlightExtensionPath(state.program_name);
+	int rc = 0;
+	if (!extension_path.empty() && lfs.FileExists(extension_path)) {
+		auto fallback_cmd = duckdb::StringUtil::Format(
+		    "LOAD '%s'; CALL start_flight_sql_server(CAST(%d AS USMALLINT))", SQLEscapeLiteral(extension_path),
+		    state.flight_sql_port);
+		rc = state.RunInitialCommand(fallback_cmd.c_str(), true);
+	} else {
+		auto command = duckdb::StringUtil::Format("%s(CAST(%d AS USMALLINT))", state.flight_sql_command,
+		                                          state.flight_sql_port);
+		rc = state.RunInitialCommand(command.c_str(), true);
+	}
+	if (rc != 0) {
+		exit(rc);
+		return MetadataResult::EXIT;
+	}
+	while (!state.seenInterrupt) {
+		ShellState::Sleep(100);
+	}
+	(void)state.RunInitialCommand("CALL stop_flight_sql_server()", false);
+	return MetadataResult::EXIT;
+}
+
 MetadataResult SetNewlineSeparator(ShellState &state, const vector<string> &args) {
 	// run the UI command
 	state.rowSeparator = args[1];
@@ -163,6 +232,8 @@ static const CommandLineOption command_line_options[] = {
     {"c", 1, "COMMAND", EnableBatch, RunCommand<true>, "run \"COMMAND\" and exit"},
     {"echo", 0, "", nullptr, EnableEcho, "print commands before execution"},
     {"f", 1, "FILENAME", EnableBatch, ProcessFile, "read/process named file and exit"},
+    {"flight-sql", 0, "[PORT]", EnableFlightSQLMode, LaunchFlightSQL,
+     "starts Arrow Flight SQL server and runs as daemon mode"},
     {"init", 1, "FILENAME", SetInitFile, nullptr, "read/process named file"},
     {"header", 0, "", nullptr, ToggleHeader<true>, "turn headers on"},
     {"h", 0, "", EnableBatch, PrintHelpAndExit, "show help message"},
