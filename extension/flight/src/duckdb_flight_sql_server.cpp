@@ -63,7 +63,7 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoForSchem
 
 Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::StreamSQL(const std::string &sql, idx_t batch_size) {
 	Connection conn(*db);
-	auto result = conn.Query(sql);
+	auto result = conn.SendQuery(sql);
 	if (!result || result->HasError()) {
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
@@ -86,7 +86,7 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoStatemen
                                                                                    const StatementQuery &command,
                                                                                    const FlightDescriptor &descriptor) {
 	Connection conn(*db);
-	auto result = conn.Query(command.query);
+	auto result = conn.SendQuery(command.query);
 	if (!result || result->HasError()) {
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
