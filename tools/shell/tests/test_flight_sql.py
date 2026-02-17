@@ -113,3 +113,30 @@ def test_flight_sql_crud_roundtrip(shell):
         assert proc.returncode == 0
         assert 'Error:' not in stderr
         assert 'Enter ".help" for usage hints.' not in stdout
+
+
+def test_flight_sql_metadata_roundtrip(shell):
+    port = find_free_port()
+    client_binary = get_flight_client_binary(shell)
+    proc = _start_flight_shell(shell, '-flight-sql', str(port))
+
+    try:
+        wait_for_server_ready(client_binary, port, timeout=20)
+        client_result = run_flight_client(client_binary, port, 'metadata', timeout=30)
+        assert (
+            client_result.returncode == 0
+        ), f"Metadata client failed with stdout='{client_result.stdout}' stderr='{client_result.stderr}'"
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+
+        try:
+            stdout, stderr = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            pytest.fail("Flight SQL daemon did not exit after SIGINT")
+
+        assert proc.returncode == 0
+        assert 'Error:' not in stderr
+        assert 'Enter ".help" for usage hints.' not in stdout

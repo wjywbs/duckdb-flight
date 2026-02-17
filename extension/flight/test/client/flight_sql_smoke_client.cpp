@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,7 @@ struct Options {
 };
 
 void PrintUsage(const char *program_name) {
-	std::cerr << "Usage: " << program_name << " --host <host> --port <port> --mode <ping|crud>\n";
+	std::cerr << "Usage: " << program_name << " --host <host> --port <port> --mode <ping|crud|metadata>\n";
 }
 
 bool ParsePort(const std::string &value, int32_t &port_out) {
@@ -75,8 +76,8 @@ bool ParseArgs(int argc, char **argv, Options &options, std::string &error) {
 		error = "--port is required";
 		return false;
 	}
-	if (options.mode != "ping" && options.mode != "crud") {
-		error = "--mode must be ping or crud";
+	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata") {
+		error = "--mode must be ping, crud or metadata";
 		return false;
 	}
 	return true;
@@ -105,10 +106,54 @@ arrow::Result<int64_t> GetIntValue(const std::shared_ptr<arrow::Array> &array, i
 	}
 }
 
+arrow::Result<std::string> GetStringValue(const std::shared_ptr<arrow::Array> &array, int64_t row) {
+	if (array->IsNull(row)) {
+		return Status::Invalid("unexpected NULL string value");
+	}
+	switch (array->type_id()) {
+	case arrow::Type::STRING:
+		return std::static_pointer_cast<arrow::StringArray>(array)->GetString(row);
+	case arrow::Type::LARGE_STRING:
+		return std::static_pointer_cast<arrow::LargeStringArray>(array)->GetString(row);
+	default:
+		return Status::TypeError("expected string array but got ", array->type()->ToString());
+	}
+}
+
+arrow::Result<int64_t> FindColumnIndex(const std::shared_ptr<arrow::Table> &table, const std::string &name) {
+	for (int64_t i = 0; i < table->num_columns(); i++) {
+		if (table->field(i)->name() == name) {
+			return i;
+		}
+	}
+	return Status::Invalid("column not found: ", name);
+}
+
+arrow::Result<std::string> GetTableString(const std::shared_ptr<arrow::Table> &table, int64_t col_idx, int64_t row_idx) {
+	if (col_idx >= table->num_columns()) {
+		return Status::Invalid("column index out of range");
+	}
+	const auto &column = table->column(col_idx);
+	if (column->num_chunks() != 1) {
+		return Status::Invalid("expected one chunk for string column");
+	}
+	return GetStringValue(column->chunk(0), row_idx);
+}
+
 arrow::Result<std::shared_ptr<arrow::Table>> ExecuteQuery(FlightSqlClient &client, const std::string &query) {
 	ARROW_ASSIGN_OR_RAISE(auto info, client.Execute({}, query));
 	if (info->endpoints().empty()) {
 		return Status::Invalid("no endpoints returned for query: ", query);
+	}
+	ARROW_ASSIGN_OR_RAISE(auto stream, client.DoGet({}, info->endpoints()[0].ticket));
+	ARROW_ASSIGN_OR_RAISE(auto table, stream->ToTable());
+	return table->CombineChunks();
+}
+
+arrow::Result<std::shared_ptr<arrow::Table>> FlightInfoToTable(FlightSqlClient &client, std::unique_ptr<arrow::flight::FlightInfo> info,
+                                                                const std::string &context) {
+	if (!info || info->endpoints().empty()) {
+		return Status::Invalid("no endpoints returned for context: ", context);
 	}
 	ARROW_ASSIGN_OR_RAISE(auto stream, client.DoGet({}, info->endpoints()[0].ticket));
 	ARROW_ASSIGN_OR_RAISE(auto table, stream->ToTable());
@@ -193,6 +238,178 @@ Status RunCrud(FlightSqlClient &client) {
 	return Status::OK();
 }
 
+Status RunMetadata(FlightSqlClient &client) {
+	auto cleanup = [&client]() {
+		(void)ExecuteUpdate(client, "DROP VIEW IF EXISTS flight_meta_view", std::nullopt);
+		(void)ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_meta_tbl", std::nullopt);
+	};
+	auto fail_with_cleanup = [&](Status status) {
+		cleanup();
+		return status;
+	};
+
+	auto status = ExecuteUpdate(client, "DROP VIEW IF EXISTS flight_meta_view", std::nullopt);
+	if (!status.ok()) {
+		return status;
+	}
+	status = ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_meta_tbl", std::nullopt);
+	if (!status.ok()) {
+		return status;
+	}
+
+	status = ExecuteUpdate(client, "CREATE TABLE flight_meta_tbl (id INTEGER, val VARCHAR)", std::nullopt);
+	if (!status.ok()) {
+		return fail_with_cleanup(std::move(status));
+	}
+	status = ExecuteUpdate(client, "CREATE VIEW flight_meta_view AS SELECT * FROM flight_meta_tbl", std::nullopt);
+	if (!status.ok()) {
+		return fail_with_cleanup(std::move(status));
+	}
+
+	std::string schema_pattern = "main";
+	auto schema_info_result = client.GetDbSchemas({}, nullptr, &schema_pattern);
+	if (!schema_info_result.ok()) {
+		return fail_with_cleanup(schema_info_result.status());
+	}
+	auto schemas_table_result =
+	    FlightInfoToTable(client, schema_info_result.MoveValueUnsafe(), "GetDbSchemas(main)");
+	if (!schemas_table_result.ok()) {
+		return fail_with_cleanup(schemas_table_result.status());
+	}
+	auto schemas_table = schemas_table_result.MoveValueUnsafe();
+	auto schema_col_result = FindColumnIndex(schemas_table, "db_schema_name");
+	if (!schema_col_result.ok()) {
+		return fail_with_cleanup(schema_col_result.status());
+	}
+	auto schema_col = schema_col_result.MoveValueUnsafe();
+	bool found_main_schema = false;
+	for (int64_t row = 0; row < schemas_table->num_rows(); row++) {
+		auto schema_name_result = GetTableString(schemas_table, schema_col, row);
+		if (!schema_name_result.ok()) {
+			return fail_with_cleanup(schema_name_result.status());
+		}
+		if (schema_name_result.MoveValueUnsafe() == "main") {
+			found_main_schema = true;
+			break;
+		}
+	}
+	if (!found_main_schema) {
+		return fail_with_cleanup(Status::Invalid("GetDbSchemas did not return schema 'main'"));
+	}
+
+	auto table_types_info_result = client.GetTableTypes({});
+	if (!table_types_info_result.ok()) {
+		return fail_with_cleanup(table_types_info_result.status());
+	}
+	auto table_types_table_result =
+	    FlightInfoToTable(client, table_types_info_result.MoveValueUnsafe(), "GetTableTypes");
+	if (!table_types_table_result.ok()) {
+		return fail_with_cleanup(table_types_table_result.status());
+	}
+	auto table_types_table = table_types_table_result.MoveValueUnsafe();
+	auto table_type_col_result = FindColumnIndex(table_types_table, "table_type");
+	if (!table_type_col_result.ok()) {
+		return fail_with_cleanup(table_type_col_result.status());
+	}
+	auto table_type_col = table_type_col_result.MoveValueUnsafe();
+	std::set<std::string> type_names;
+	for (int64_t row = 0; row < table_types_table->num_rows(); row++) {
+		auto table_type_result = GetTableString(table_types_table, table_type_col, row);
+		if (!table_type_result.ok()) {
+			return fail_with_cleanup(table_type_result.status());
+		}
+		type_names.insert(table_type_result.MoveValueUnsafe());
+	}
+	if (!type_names.count("TABLE") || !type_names.count("VIEW")) {
+		return fail_with_cleanup(
+		    Status::Invalid("GetTableTypes did not include expected TABLE/VIEW values"));
+	}
+
+	std::string table_pattern = "flight_meta_%";
+	auto tables_info_result = client.GetTables({}, nullptr, &schema_pattern, &table_pattern, false, nullptr);
+	if (!tables_info_result.ok()) {
+		return fail_with_cleanup(tables_info_result.status());
+	}
+	auto tables_table_result = FlightInfoToTable(client, tables_info_result.MoveValueUnsafe(), "GetTables(pattern)");
+	if (!tables_table_result.ok()) {
+		return fail_with_cleanup(tables_table_result.status());
+	}
+	auto tables_table = tables_table_result.MoveValueUnsafe();
+	auto table_name_col_result = FindColumnIndex(tables_table, "table_name");
+	if (!table_name_col_result.ok()) {
+		return fail_with_cleanup(table_name_col_result.status());
+	}
+	auto table_type_name_col_result = FindColumnIndex(tables_table, "table_type");
+	if (!table_type_name_col_result.ok()) {
+		return fail_with_cleanup(table_type_name_col_result.status());
+	}
+	auto table_name_col = table_name_col_result.MoveValueUnsafe();
+	auto table_type_name_col = table_type_name_col_result.MoveValueUnsafe();
+	bool saw_meta_table = false;
+	bool saw_meta_view = false;
+	for (int64_t row = 0; row < tables_table->num_rows(); row++) {
+		auto table_name_result = GetTableString(tables_table, table_name_col, row);
+		if (!table_name_result.ok()) {
+			return fail_with_cleanup(table_name_result.status());
+		}
+		auto table_type_result = GetTableString(tables_table, table_type_name_col, row);
+		if (!table_type_result.ok()) {
+			return fail_with_cleanup(table_type_result.status());
+		}
+		auto table_name = table_name_result.MoveValueUnsafe();
+		auto table_type = table_type_result.MoveValueUnsafe();
+		if (table_name == "flight_meta_tbl" && table_type == "TABLE") {
+			saw_meta_table = true;
+		} else if (table_name == "flight_meta_view" && table_type == "VIEW") {
+			saw_meta_view = true;
+		}
+	}
+	if (!saw_meta_table || !saw_meta_view) {
+		return fail_with_cleanup(Status::Invalid(
+		    "GetTables did not return expected flight_meta_tbl/flight_meta_view entries"));
+	}
+
+	std::vector<std::string> only_tables {"TABLE"};
+	auto filtered_tables_info_result =
+	    client.GetTables({}, nullptr, &schema_pattern, &table_pattern, false, &only_tables);
+	if (!filtered_tables_info_result.ok()) {
+		return fail_with_cleanup(filtered_tables_info_result.status());
+	}
+	auto filtered_table_result =
+	    FlightInfoToTable(client, filtered_tables_info_result.MoveValueUnsafe(), "GetTables(table_types)");
+	if (!filtered_table_result.ok()) {
+		return fail_with_cleanup(filtered_table_result.status());
+	}
+	auto filtered_tables = filtered_table_result.MoveValueUnsafe();
+	auto filtered_table_name_col_result = FindColumnIndex(filtered_tables, "table_name");
+	if (!filtered_table_name_col_result.ok()) {
+		return fail_with_cleanup(filtered_table_name_col_result.status());
+	}
+	auto filtered_table_name_col = filtered_table_name_col_result.MoveValueUnsafe();
+	bool saw_only_meta_table = false;
+	for (int64_t row = 0; row < filtered_tables->num_rows(); row++) {
+		auto table_name_result = GetTableString(filtered_tables, filtered_table_name_col, row);
+		if (!table_name_result.ok()) {
+			return fail_with_cleanup(table_name_result.status());
+		}
+		auto table_name = table_name_result.MoveValueUnsafe();
+		if (table_name == "flight_meta_view") {
+			return fail_with_cleanup(
+			    Status::Invalid("GetTables table_type filter returned view entry unexpectedly"));
+		}
+		if (table_name == "flight_meta_tbl") {
+			saw_only_meta_table = true;
+		}
+	}
+	if (!saw_only_meta_table) {
+		return fail_with_cleanup(
+		    Status::Invalid("GetTables table_type filter did not return expected table entry"));
+	}
+
+	cleanup();
+	return Status::OK();
+}
+
 Status RunMain(const Options &options) {
 	ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp(options.host, options.port));
 	ARROW_ASSIGN_OR_RAISE(auto client, FlightClient::Connect(location));
@@ -201,6 +418,8 @@ Status RunMain(const Options &options) {
 	Status status;
 	if (options.mode == "ping") {
 		status = RunPing(sql_client);
+	} else if (options.mode == "metadata") {
+		status = RunMetadata(sql_client);
 	} else {
 		status = RunCrud(sql_client);
 	}
