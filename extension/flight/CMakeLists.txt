@@ -67,3 +67,19 @@ target_link_libraries(${TARGET_NAME}_loadable_extension
                       arrow_flight_sql_static
                       arrow_flight_static
                       arrow_static)
+
+add_executable(flight_sql_smoke_client test/client/flight_sql_smoke_client.cpp)
+set_target_properties(flight_sql_smoke_client PROPERTIES
+                      CXX_STANDARD 20
+                      CXX_STANDARD_REQUIRED ON
+                      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/extension/flight")
+
+target_include_directories(flight_sql_smoke_client PRIVATE
+                           src/include
+                           ${CMAKE_SOURCE_DIR}/third_party/arrow/cpp/src
+                           ${CMAKE_BINARY_DIR}/third_party_arrow/src)
+
+target_link_libraries(flight_sql_smoke_client
+                      arrow_flight_sql_static
+                      arrow_flight_static
+                      arrow_static)
