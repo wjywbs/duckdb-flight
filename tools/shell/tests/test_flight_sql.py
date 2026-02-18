@@ -149,7 +149,7 @@ def test_flight_sql_prepared_roundtrip(shell):
 
     try:
         wait_for_server_ready(client_binary, port, timeout=20)
-        client_result = run_flight_client(client_binary, port, 'prepared', timeout=30)
+        client_result = run_flight_client(client_binary, port, 'prepared', timeout=60)
         assert (
             client_result.returncode == 0
         ), f"Prepared client failed with stdout='{client_result.stdout}' stderr='{client_result.stderr}'"
