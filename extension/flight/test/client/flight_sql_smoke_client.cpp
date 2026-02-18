@@ -1,14 +1,20 @@
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <google/protobuf/any.pb.h>
 
 #include "arrow/api.h"
 #include "arrow/flight/api.h"
+#include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/sql/client.h"
+#include "arrow/flight/sql/protocol_internal.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
 
@@ -17,6 +23,7 @@ using arrow::flight::FlightClient;
 using arrow::flight::Location;
 using arrow::flight::sql::FlightSqlClient;
 using arrow::flight::sql::PreparedStatement;
+namespace flight_sql_pb = arrow::flight::protocol::sql;
 
 namespace {
 
@@ -283,6 +290,71 @@ Status ClosePreparedStatement(const std::shared_ptr<PreparedStatement> &statemen
 	return statement->Close();
 }
 
+template <class T>
+arrow::Result<arrow::flight::FlightDescriptor> PackCommandDescriptor(const T &command) {
+	arrow::flight::FlightDescriptor descriptor;
+	ARROW_RETURN_NOT_OK(arrow::flight::internal::PackProtoCommand(command, &descriptor));
+	return descriptor;
+}
+
+template <class T>
+arrow::Result<std::unique_ptr<arrow::flight::ResultStream>> DoProtoAction(FlightSqlClient &client,
+                                                                           const std::string &action_type,
+                                                                           const T &action) {
+	arrow::flight::Action packed_action;
+	ARROW_RETURN_NOT_OK(arrow::flight::internal::PackProtoAction(action_type, action, &packed_action));
+	return client.DoAction({}, packed_action);
+}
+
+arrow::Result<std::string> CreatePreparedHandleRaw(FlightSqlClient &client, const std::string &query) {
+	flight_sql_pb::ActionCreatePreparedStatementRequest request;
+	request.set_query(query);
+
+	ARROW_ASSIGN_OR_RAISE(auto results, DoProtoAction(client, "CreatePreparedStatement", request));
+	ARROW_ASSIGN_OR_RAISE(auto result, results->Next());
+	if (!result || !result->body) {
+		return Status::Invalid("CreatePreparedStatement returned no payload");
+	}
+
+	google::protobuf::Any container;
+	if (!container.ParseFromArray(result->body->data(), static_cast<int>(result->body->size()))) {
+		return Status::Invalid("Unable to parse Any for ActionCreatePreparedStatementResult");
+	}
+
+	flight_sql_pb::ActionCreatePreparedStatementResult response;
+	if (!container.UnpackTo(&response)) {
+		return Status::Invalid("Unable to unpack ActionCreatePreparedStatementResult");
+	}
+
+	ARROW_RETURN_NOT_OK(results->Drain());
+	return response.prepared_statement_handle();
+}
+
+Status ClosePreparedHandleRaw(FlightSqlClient &client, const std::string &handle) {
+	flight_sql_pb::ActionClosePreparedStatementRequest request;
+	request.set_prepared_statement_handle(handle);
+	ARROW_ASSIGN_OR_RAISE(auto results, DoProtoAction(client, "ClosePreparedStatement", request));
+	return results->Drain();
+}
+
+arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetPreparedFlightInfoRaw(FlightSqlClient &client,
+                                                                                    const std::string &handle) {
+	flight_sql_pb::CommandPreparedStatementQuery command;
+	command.set_prepared_statement_handle(handle);
+	ARROW_ASSIGN_OR_RAISE(auto descriptor, PackCommandDescriptor(command));
+	return client.GetFlightInfo({}, descriptor);
+}
+
+arrow::Result<int64_t> FetchPreparedRowCountRaw(FlightSqlClient &client, const std::string &handle) {
+	ARROW_ASSIGN_OR_RAISE(auto info, GetPreparedFlightInfoRaw(client, handle));
+	if (!info || info->endpoints().empty()) {
+		return Status::Invalid("Prepared query returned no endpoints");
+	}
+	ARROW_ASSIGN_OR_RAISE(auto stream, client.DoGet({}, info->endpoints()[0].ticket));
+	ARROW_ASSIGN_OR_RAISE(auto table, stream->ToTable());
+	return table->num_rows();
+}
+
 Status RunPing(FlightSqlClient &client) {
 	ARROW_ASSIGN_OR_RAISE(auto table, ExecuteQuery(client, "SELECT 1 AS one"));
 	if (table->num_columns() != 1 || table->num_rows() != 1) {
@@ -524,17 +596,24 @@ Status RunMetadata(FlightSqlClient &client) {
 	return Status::OK();
 }
 
-Status RunPrepared(FlightSqlClient &client) {
+Status RunPrepared(FlightSqlClient &client, const Options &options) {
 	std::vector<std::shared_ptr<PreparedStatement>> statements;
+	std::vector<std::string> raw_handles;
 	auto cleanup = [&]() {
 		for (auto &statement : statements) {
 			(void)ClosePreparedStatement(statement);
+		}
+		for (auto &handle : raw_handles) {
+			(void)ClosePreparedHandleRaw(client, handle);
 		}
 		(void)ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_prep_it", std::nullopt);
 	};
 	auto fail_with_cleanup = [&](Status status) {
 		cleanup();
 		return status;
+	};
+	auto contextual_fail = [&](const std::string &context, const Status &status) {
+		return fail_with_cleanup(Status::Invalid(context, ": ", status.ToString()));
 	};
 
 	auto status = ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_prep_it", std::nullopt);
@@ -556,24 +635,40 @@ Status RunPrepared(FlightSqlClient &client) {
 	if (!insert_schema || insert_schema->num_fields() != 2) {
 		return fail_with_cleanup(Status::Invalid("unexpected parameter schema for insert prepared statement"));
 	}
-	ARROW_ASSIGN_OR_RAISE(auto insert_id_array, BuildIntegerArray(insert_schema->field(0)->type(), {1, 2, 3}));
-	ARROW_ASSIGN_OR_RAISE(auto insert_val_array, BuildStringArray(insert_schema->field(1)->type(), {"a", "b", "c"}));
-	auto insert_batch = arrow::RecordBatch::Make(insert_schema, 3, {insert_id_array, insert_val_array});
+	ARROW_ASSIGN_OR_RAISE(auto insert_id_array, BuildIntegerArray(insert_schema->field(0)->type(), {1, 2}));
+	ARROW_ASSIGN_OR_RAISE(auto insert_val_array, BuildStringArray(insert_schema->field(1)->type(), {"a", "b"}));
+	auto insert_batch = arrow::RecordBatch::Make(insert_schema, 2, {insert_id_array, insert_val_array});
 	status = prepared_insert->SetParameters(insert_batch);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared insert set parameters", status);
 	}
 	auto insert_rows_result = prepared_insert->ExecuteUpdate({});
 	if (!insert_rows_result.ok()) {
-		return fail_with_cleanup(insert_rows_result.status());
+		return contextual_fail("prepared insert execute update", insert_rows_result.status());
 	}
-	if (insert_rows_result.ValueOrDie() != 3) {
+	if (insert_rows_result.ValueOrDie() != 2) {
 		return fail_with_cleanup(
-		    Status::Invalid("prepared insert expected 3 affected rows, got ", insert_rows_result.ValueOrDie()));
+		    Status::Invalid("prepared insert expected 2 affected rows, got ", insert_rows_result.ValueOrDie()));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto insert_id_array_second, BuildIntegerArray(insert_schema->field(0)->type(), {3}));
+	ARROW_ASSIGN_OR_RAISE(auto insert_val_array_second, BuildStringArray(insert_schema->field(1)->type(), {"c"}));
+	auto insert_batch_second = arrow::RecordBatch::Make(insert_schema, 1, {insert_id_array_second, insert_val_array_second});
+	status = prepared_insert->SetParameters(insert_batch_second);
+	if (!status.ok()) {
+		return contextual_fail("prepared insert second set parameters", status);
+	}
+	auto insert_rows_result_second = prepared_insert->ExecuteUpdate({});
+	if (!insert_rows_result_second.ok()) {
+		return contextual_fail("prepared insert second execute update", insert_rows_result_second.status());
+	}
+	if (insert_rows_result_second.ValueOrDie() != 1) {
+		return fail_with_cleanup(
+		    Status::Invalid("second prepared insert expected 1 affected row, got ", insert_rows_result_second.ValueOrDie()));
 	}
 	status = ClosePreparedStatement(prepared_insert);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared insert close", status);
 	}
 
 	auto prepared_update_result = client.Prepare({}, "UPDATE flight_prep_it SET val = ? WHERE id = ?");
@@ -586,24 +681,40 @@ Status RunPrepared(FlightSqlClient &client) {
 	if (!update_schema || update_schema->num_fields() != 2) {
 		return fail_with_cleanup(Status::Invalid("unexpected parameter schema for update prepared statement"));
 	}
-	ARROW_ASSIGN_OR_RAISE(auto update_val_array, BuildStringArray(update_schema->field(0)->type(), {"bb", "cc"}));
-	ARROW_ASSIGN_OR_RAISE(auto update_id_array, BuildIntegerArray(update_schema->field(1)->type(), {2, 3}));
-	auto update_batch = arrow::RecordBatch::Make(update_schema, 2, {update_val_array, update_id_array});
+	ARROW_ASSIGN_OR_RAISE(auto update_val_array, BuildStringArray(update_schema->field(0)->type(), {"bb"}));
+	ARROW_ASSIGN_OR_RAISE(auto update_id_array, BuildIntegerArray(update_schema->field(1)->type(), {2}));
+	auto update_batch = arrow::RecordBatch::Make(update_schema, 1, {update_val_array, update_id_array});
 	status = prepared_update->SetParameters(update_batch);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared update set parameters", status);
 	}
 	auto update_rows_result = prepared_update->ExecuteUpdate({});
 	if (!update_rows_result.ok()) {
-		return fail_with_cleanup(update_rows_result.status());
+		return contextual_fail("prepared update execute update", update_rows_result.status());
 	}
-	if (update_rows_result.ValueOrDie() != 2) {
+	if (update_rows_result.ValueOrDie() != 1) {
 		return fail_with_cleanup(
-		    Status::Invalid("prepared update expected 2 affected rows, got ", update_rows_result.ValueOrDie()));
+		    Status::Invalid("prepared update expected 1 affected row, got ", update_rows_result.ValueOrDie()));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto update_val_array_second, BuildStringArray(update_schema->field(0)->type(), {"cc"}));
+	ARROW_ASSIGN_OR_RAISE(auto update_id_array_second, BuildIntegerArray(update_schema->field(1)->type(), {3}));
+	auto update_batch_second = arrow::RecordBatch::Make(update_schema, 1, {update_val_array_second, update_id_array_second});
+	status = prepared_update->SetParameters(update_batch_second);
+	if (!status.ok()) {
+		return contextual_fail("prepared update second set parameters", status);
+	}
+	auto update_rows_result_second = prepared_update->ExecuteUpdate({});
+	if (!update_rows_result_second.ok()) {
+		return contextual_fail("prepared update second execute update", update_rows_result_second.status());
+	}
+	if (update_rows_result_second.ValueOrDie() != 1) {
+		return fail_with_cleanup(
+		    Status::Invalid("second prepared update expected 1 affected row, got ", update_rows_result_second.ValueOrDie()));
 	}
 	status = ClosePreparedStatement(prepared_update);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared update close", status);
 	}
 
 	auto prepared_query_result = client.Prepare({}, "SELECT id, val FROM flight_prep_it WHERE id > ? ORDER BY id");
@@ -620,11 +731,11 @@ Status RunPrepared(FlightSqlClient &client) {
 	auto query_batch = arrow::RecordBatch::Make(query_schema, 1, {query_id_array});
 	status = prepared_query->SetParameters(query_batch);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared query set parameters", status);
 	}
 	auto query_info_result = prepared_query->Execute({});
 	if (!query_info_result.ok()) {
-		return fail_with_cleanup(query_info_result.status());
+		return contextual_fail("prepared query execute", query_info_result.status());
 	}
 	auto query_info = std::move(query_info_result).ValueOrDie();
 	auto query_table_result = FlightInfoToTable(client, std::move(query_info), "Prepared query");
@@ -650,9 +761,30 @@ Status RunPrepared(FlightSqlClient &client) {
 			return fail_with_cleanup(Status::Invalid("unexpected val in prepared query result: ", val));
 		}
 	}
+
+	ARROW_ASSIGN_OR_RAISE(auto query_id_array_second, BuildIntegerArray(query_schema->field(0)->type(), {0}));
+	auto query_batch_second = arrow::RecordBatch::Make(query_schema, 1, {query_id_array_second});
+	status = prepared_query->SetParameters(query_batch_second);
+	if (!status.ok()) {
+		return contextual_fail("prepared query second set parameters", status);
+	}
+	auto query_info_result_second = prepared_query->Execute({});
+	if (!query_info_result_second.ok()) {
+		return contextual_fail("prepared query second execute", query_info_result_second.status());
+	}
+	auto query_info_second = std::move(query_info_result_second).ValueOrDie();
+	auto query_table_result_second = FlightInfoToTable(client, std::move(query_info_second), "Prepared query (second)");
+	if (!query_table_result_second.ok()) {
+		return fail_with_cleanup(query_table_result_second.status());
+	}
+	auto query_table_second = query_table_result_second.MoveValueUnsafe();
+	if (query_table_second->num_columns() != 2 || query_table_second->num_rows() != 3) {
+		return fail_with_cleanup(Status::Invalid("second prepared query returned unexpected shape"));
+	}
+
 	status = ClosePreparedStatement(prepared_query);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared query close", status);
 	}
 
 	auto prepared_multirow_query_result = client.Prepare({}, "SELECT ?::INTEGER AS x");
@@ -671,7 +803,7 @@ Status RunPrepared(FlightSqlClient &client) {
 	auto multirow_batch = arrow::RecordBatch::Make(multirow_query_schema, 2, {multirow_query_array});
 	status = prepared_multirow_query->SetParameters(multirow_batch);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared single-row enforcement set parameters", status);
 	}
 	auto multirow_exec_result = prepared_multirow_query->Execute({});
 	if (multirow_exec_result.ok()) {
@@ -680,12 +812,90 @@ Status RunPrepared(FlightSqlClient &client) {
 	}
 	status = ClosePreparedStatement(prepared_multirow_query);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("prepared single-row enforcement close", status);
+	}
+
+	auto malformed_handle_result = GetPreparedFlightInfoRaw(client, std::string("bad"));
+	if (malformed_handle_result.ok()) {
+		return fail_with_cleanup(Status::Invalid("malformed prepared handle unexpectedly succeeded"));
+	}
+	if (malformed_handle_result.status().ToString().find("Invalid prepared statement handle encoding") ==
+	    std::string::npos) {
+		return fail_with_cleanup(Status::Invalid("malformed handle returned unexpected error: ",
+		                                        malformed_handle_result.status().ToString()));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto closed_handle, CreatePreparedHandleRaw(client, "SELECT 42"));
+	raw_handles.push_back(closed_handle);
+	status = ClosePreparedHandleRaw(client, closed_handle);
+	if (!status.ok()) {
+		return contextual_fail("close raw prepared handle", status);
+	}
+	raw_handles.pop_back();
+	auto closed_reuse_result = GetPreparedFlightInfoRaw(client, closed_handle);
+	if (closed_reuse_result.ok()) {
+		return fail_with_cleanup(Status::Invalid("closed prepared handle unexpectedly remained executable"));
+	}
+	if (closed_reuse_result.status().ToString().find("Prepared statement not found") == std::string::npos) {
+		return fail_with_cleanup(Status::Invalid("closed-handle reuse returned unexpected error: ",
+		                                        closed_reuse_result.status().ToString()));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto shared_handle,
+	                      CreatePreparedHandleRaw(client, "SELECT i::BIGINT AS i FROM range(25000) t(i)"));
+	raw_handles.push_back(shared_handle);
+	ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp(options.host, options.port));
+	ARROW_ASSIGN_OR_RAISE(auto flight_client_one, FlightClient::Connect(location));
+	ARROW_ASSIGN_OR_RAISE(auto flight_client_two, FlightClient::Connect(location));
+	FlightSqlClient client_one(std::move(flight_client_one));
+	FlightSqlClient client_two(std::move(flight_client_two));
+
+	Status first_concurrent_status = Status::OK();
+	Status second_concurrent_status = Status::OK();
+	int64_t first_concurrent_rows = -1;
+	int64_t second_concurrent_rows = -1;
+	std::thread first_query_thread([&]() {
+		auto row_count_result = FetchPreparedRowCountRaw(client_one, shared_handle);
+		if (!row_count_result.ok()) {
+			first_concurrent_status = row_count_result.status();
+			return;
+		}
+		first_concurrent_rows = row_count_result.ValueOrDie();
+	});
+	std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	std::thread second_query_thread([&]() {
+		auto row_count_result = FetchPreparedRowCountRaw(client_two, shared_handle);
+		if (!row_count_result.ok()) {
+			second_concurrent_status = row_count_result.status();
+			return;
+		}
+		second_concurrent_rows = row_count_result.ValueOrDie();
+	});
+	first_query_thread.join();
+	second_query_thread.join();
+	auto close_one_status = client_one.Close();
+	auto close_two_status = client_two.Close();
+	if (!close_one_status.ok()) {
+		return contextual_fail("close concurrent client one", close_one_status);
+	}
+	if (!close_two_status.ok()) {
+		return contextual_fail("close concurrent client two", close_two_status);
+	}
+	if (!first_concurrent_status.ok()) {
+		return fail_with_cleanup(first_concurrent_status);
+	}
+	if (!second_concurrent_status.ok()) {
+		return fail_with_cleanup(second_concurrent_status);
+	}
+	if (first_concurrent_rows != 25000 || second_concurrent_rows != 25000) {
+		return fail_with_cleanup(
+		    Status::Invalid("concurrent prepared queries returned unexpected row counts: ", first_concurrent_rows,
+		                    ", ", second_concurrent_rows));
 	}
 
 	status = ExecuteUpdate(client, "DROP TABLE flight_prep_it", std::nullopt);
 	if (!status.ok()) {
-		return fail_with_cleanup(status);
+		return contextual_fail("drop flight_prep_it", status);
 	}
 	cleanup();
 	return Status::OK();
@@ -702,7 +912,7 @@ Status RunMain(const Options &options) {
 	} else if (options.mode == "metadata") {
 		status = RunMetadata(sql_client);
 	} else if (options.mode == "prepared") {
-		status = RunPrepared(sql_client);
+		status = RunPrepared(sql_client, options);
 	} else {
 		status = RunCrud(sql_client);
 	}
