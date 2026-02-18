@@ -1,6 +1,7 @@
 #include "duckdb_flight_sql_server.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -175,15 +176,73 @@ static std::vector<PreparedParameterDefinition> BuildOrderedParameters(PreparedS
 	return ordered_parameters;
 }
 
+static std::string EncodePreparedHandle(const uint64_t handle_id) {
+	std::string encoded(8, '\0');
+	for (idx_t i = 0; i < 8; i++) {
+		encoded[i] = static_cast<char>((handle_id >> (i * 8)) & 0xFF);
+	}
+	return encoded;
+}
+
+static Result<uint64_t> DecodePreparedHandle(const std::string &encoded_handle) {
+	if (encoded_handle.size() != 8) {
+		return Status::Invalid("Invalid prepared statement handle encoding");
+	}
+	uint64_t value = 0;
+	for (idx_t i = 0; i < 8; i++) {
+		const auto byte_value = static_cast<uint8_t>(encoded_handle[i]);
+		value |= static_cast<uint64_t>(byte_value) << (i * 8);
+	}
+	return value;
+}
+
 } // namespace
 
 struct DuckDBFlightSqlServer::PreparedStatementState {
-	std::string query;
 	std::vector<PreparedParameterDefinition> ordered_parameters;
 	std::shared_ptr<Schema> dataset_schema;
 	std::optional<case_insensitive_map_t<BoundParameterData>> query_bound_parameters;
-	std::mutex mutex;
+	unique_ptr<Connection> connection;
+	unique_ptr<PreparedStatement> prepared;
+	std::shared_mutex mutex;
 };
+
+namespace {
+
+class LockedFlightDataStream : public FlightDataStream {
+public:
+	LockedFlightDataStream(std::unique_ptr<FlightDataStream> inner, std::unique_lock<std::shared_mutex> state_lock,
+	                       std::shared_ptr<void> state_guard)
+	    : inner(std::move(inner)), state_lock(std::move(state_lock)), state_guard(std::move(state_guard)) {
+	}
+
+	std::shared_ptr<Schema> schema() override {
+		return inner->schema();
+	}
+
+	Result<arrow::flight::FlightPayload> GetSchemaPayload() override {
+		return inner->GetSchemaPayload();
+	}
+
+	Result<arrow::flight::FlightPayload> Next() override {
+		return inner->Next();
+	}
+
+	Status Close() override {
+		auto status = inner->Close();
+		if (state_lock.owns_lock()) {
+			state_lock.unlock();
+		}
+		return status;
+	}
+
+private:
+	std::unique_ptr<FlightDataStream> inner;
+	std::unique_lock<std::shared_mutex> state_lock;
+	std::shared_ptr<void> state_guard;
+};
+
+} // namespace
 
 DuckDBFlightSqlServer::DuckDBFlightSqlServer(shared_ptr<DatabaseInstance> db_instance) : db(std::move(db_instance)) {
 	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_NAME, SqlInfoResult(std::string("duckdb-flight-sql")));
@@ -210,17 +269,18 @@ DuckDBFlightSqlServer::DuckDBFlightSqlServer(shared_ptr<DatabaseInstance> db_ins
 
 Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePreparedStatement(
     const ServerCallContext & /*context*/, const ActionCreatePreparedStatementRequest &request) {
-	Connection conn(*db);
-	auto prepared = conn.Prepare(request.query);
-	if (!prepared || prepared->HasError()) {
-		return Status::Invalid(prepared ? prepared->GetError() : "Unknown DuckDB prepared statement failure");
+	auto state = std::make_shared<PreparedStatementState>();
+	state->connection = make_uniq<Connection>(*db);
+	state->prepared = state->connection->Prepare(request.query);
+	if (!state->prepared || state->prepared->HasError()) {
+		return Status::Invalid(state->prepared ? state->prepared->GetError() : "Unknown DuckDB prepared statement failure");
 	}
 
-	auto ordered_parameters = BuildOrderedParameters(*prepared);
+	auto ordered_parameters = BuildOrderedParameters(*state->prepared);
 
-	auto client_properties = conn.context->GetClientProperties();
+	auto client_properties = state->connection->context->GetClientProperties();
 	ARROW_ASSIGN_OR_RAISE(auto dataset_schema,
-	                      DuckDBSchemaToArrow(prepared->GetTypes(), prepared->GetNames(), client_properties));
+	                      DuckDBSchemaToArrow(state->prepared->GetTypes(), state->prepared->GetNames(), client_properties));
 
 	vector<LogicalType> parameter_types;
 	vector<std::string> parameter_names;
@@ -232,16 +292,15 @@ Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePrepare
 	}
 	ARROW_ASSIGN_OR_RAISE(auto parameter_schema, DuckDBSchemaToArrow(parameter_types, parameter_names, client_properties));
 
-	auto state = std::make_shared<PreparedStatementState>();
-	state->query = request.query;
 	state->ordered_parameters = std::move(ordered_parameters);
 	state->dataset_schema = dataset_schema;
 	state->query_bound_parameters.reset();
 
 	auto handle = GeneratePreparedHandle();
+	ARROW_ASSIGN_OR_RAISE(auto handle_id, DecodePreparedHandle(handle));
 	{
 		std::lock_guard<std::mutex> guard(prepared_statements_mutex);
-		prepared_statements[handle] = state;
+		prepared_statements[handle_id] = state;
 	}
 
 	return ActionCreatePreparedStatementResult {std::move(dataset_schema), std::move(parameter_schema), std::move(handle)};
@@ -249,8 +308,12 @@ Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePrepare
 
 Status DuckDBFlightSqlServer::ClosePreparedStatement(const ServerCallContext & /*context*/,
                                                      const ActionClosePreparedStatementRequest &request) {
+	auto handle_id_result = DecodePreparedHandle(request.prepared_statement_handle);
+	if (!handle_id_result.ok()) {
+		return handle_id_result.status();
+	}
 	std::lock_guard<std::mutex> guard(prepared_statements_mutex);
-	auto erased_count = prepared_statements.erase(request.prepared_statement_handle);
+	auto erased_count = prepared_statements.erase(handle_id_result.ValueOrDie());
 	if (erased_count == 0) {
 		return Status::Invalid("Prepared statement not found");
 	}
@@ -267,8 +330,9 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoForSchem
 
 Result<std::shared_ptr<DuckDBFlightSqlServer::PreparedStatementState>>
 DuckDBFlightSqlServer::LookupPreparedStatement(const std::string &handle) {
+	ARROW_ASSIGN_OR_RAISE(auto handle_id, DecodePreparedHandle(handle));
 	std::lock_guard<std::mutex> guard(prepared_statements_mutex);
-	auto entry = prepared_statements.find(handle);
+	auto entry = prepared_statements.find(handle_id);
 	if (entry == prepared_statements.end()) {
 		return Status::Invalid("Prepared statement not found");
 	}
@@ -277,7 +341,7 @@ DuckDBFlightSqlServer::LookupPreparedStatement(const std::string &handle) {
 
 std::string DuckDBFlightSqlServer::GeneratePreparedHandle() {
 	auto next = prepared_statement_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-	return StringUtil::Format("duckdb_flight_prepared_%llu", static_cast<unsigned long long>(next));
+	return EncodePreparedHandle(next);
 }
 
 Result<std::shared_ptr<Schema>> DuckDBFlightSqlServer::DuckDBSchemaToArrow(const vector<LogicalType> &types,
@@ -349,7 +413,7 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoPrepared
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 	std::shared_ptr<Schema> dataset_schema;
 	{
-		std::lock_guard<std::mutex> guard(state->mutex);
+		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		dataset_schema = state->dataset_schema;
 	}
 	return GetFlightInfoForSchema(descriptor, dataset_schema);
@@ -361,7 +425,7 @@ Result<std::unique_ptr<SchemaResult>> DuckDBFlightSqlServer::GetSchemaPreparedSt
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 	std::shared_ptr<Schema> dataset_schema;
 	{
-		std::lock_guard<std::mutex> guard(state->mutex);
+		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		dataset_schema = state->dataset_schema;
 	}
 	return SchemaResult::Make(*dataset_schema);
@@ -371,35 +435,26 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetPreparedSt
     const ServerCallContext & /*context*/, const PreparedStatementQuery &command) {
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 
-	std::string query;
-	std::vector<PreparedParameterDefinition> ordered_parameters;
-	std::optional<case_insensitive_map_t<BoundParameterData>> query_bound_parameters;
-	{
-		std::lock_guard<std::mutex> guard(state->mutex);
-		query = state->query;
-		ordered_parameters = state->ordered_parameters;
-		query_bound_parameters = state->query_bound_parameters;
+	std::unique_lock<std::shared_mutex> state_lock(state->mutex);
+	if (!state->prepared || !state->connection) {
+		return Status::Invalid("Prepared statement state is not initialized");
 	}
 
-	if (!ordered_parameters.empty() && !query_bound_parameters.has_value()) {
+	if (!state->ordered_parameters.empty() && !state->query_bound_parameters.has_value()) {
 		return Status::Invalid("No parameter binding found for prepared statement query");
 	}
 
-	Connection conn(*db);
-	auto prepared = conn.Prepare(query);
-	if (!prepared || prepared->HasError()) {
-		return Status::Invalid(prepared ? prepared->GetError() : "Unknown DuckDB prepared statement failure");
-	}
-
 	case_insensitive_map_t<BoundParameterData> named_values;
-	if (query_bound_parameters.has_value()) {
-		named_values = query_bound_parameters.value();
+	if (state->query_bound_parameters.has_value()) {
+		named_values = state->query_bound_parameters.value();
 	}
-	auto result = prepared->Execute(named_values, true);
+	auto result = state->prepared->Execute(named_values, true);
 	if (!result || result->HasError()) {
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
-	return ResultToFlightStream(std::move(result));
+
+	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(state_lock), std::shared_ptr<void>(state));
 }
 
 Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContext & /*context*/,
@@ -410,7 +465,7 @@ Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContex
 
 	std::vector<PreparedParameterDefinition> ordered_parameters;
 	{
-		std::lock_guard<std::mutex> guard(state->mutex);
+		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		ordered_parameters = state->ordered_parameters;
 	}
 
@@ -420,7 +475,7 @@ Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContex
 	}
 
 	{
-		std::lock_guard<std::mutex> guard(state->mutex);
+		std::unique_lock<std::shared_mutex> guard(state->mutex);
 		if (ordered_parameters.empty()) {
 			state->query_bound_parameters = case_insensitive_map_t<BoundParameterData> {};
 		} else if (bound_rows.empty()) {
@@ -438,24 +493,20 @@ Result<int64_t> DuckDBFlightSqlServer::DoPutPreparedStatementUpdate(const Server
                                                                     FlightMessageReader *reader) {
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 
-	std::string query;
 	std::vector<PreparedParameterDefinition> ordered_parameters;
 	{
-		std::lock_guard<std::mutex> guard(state->mutex);
-		query = state->query;
+		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		ordered_parameters = state->ordered_parameters;
-	}
-
-	Connection conn(*db);
-	auto prepared = conn.Prepare(query);
-	if (!prepared || prepared->HasError()) {
-		return Status::Invalid(prepared ? prepared->GetError() : "Unknown DuckDB prepared statement failure");
 	}
 
 	int64_t rows_changed = 0;
 	if (ordered_parameters.empty()) {
+		std::unique_lock<std::shared_mutex> guard(state->mutex);
+		if (!state->prepared || !state->connection) {
+			return Status::Invalid("Prepared statement state is not initialized");
+		}
 		case_insensitive_map_t<BoundParameterData> empty_parameters;
-		auto result = prepared->Execute(empty_parameters, false);
+		auto result = state->prepared->Execute(empty_parameters, false);
 		if (!result || result->HasError()) {
 			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}
@@ -468,8 +519,12 @@ Result<int64_t> DuckDBFlightSqlServer::DoPutPreparedStatementUpdate(const Server
 		return Status::Invalid("Prepared statement update expected at least one bound parameter row");
 	}
 
+	std::unique_lock<std::shared_mutex> guard(state->mutex);
+	if (!state->prepared || !state->connection) {
+		return Status::Invalid("Prepared statement state is not initialized");
+	}
 	for (auto &named_values : bound_rows) {
-		auto result = prepared->Execute(named_values, false);
+		auto result = state->prepared->Execute(named_values, false);
 		if (!result || result->HasError()) {
 			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}

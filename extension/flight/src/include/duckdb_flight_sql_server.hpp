@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -76,7 +78,7 @@ private:
 
 	shared_ptr<DatabaseInstance> db;
 	std::mutex prepared_statements_mutex;
-	std::unordered_map<std::string, std::shared_ptr<PreparedStatementState>> prepared_statements;
+	std::unordered_map<uint64_t, std::shared_ptr<PreparedStatementState>> prepared_statements;
 	std::atomic<uint64_t> prepared_statement_counter {0};
 
 	arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetFlightInfoForSchema(
