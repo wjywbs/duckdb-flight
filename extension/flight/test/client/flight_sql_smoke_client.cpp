@@ -16,6 +16,7 @@ using arrow::Status;
 using arrow::flight::FlightClient;
 using arrow::flight::Location;
 using arrow::flight::sql::FlightSqlClient;
+using arrow::flight::sql::PreparedStatement;
 
 namespace {
 
@@ -26,7 +27,7 @@ struct Options {
 };
 
 void PrintUsage(const char *program_name) {
-	std::cerr << "Usage: " << program_name << " --host <host> --port <port> --mode <ping|crud|metadata>\n";
+	std::cerr << "Usage: " << program_name << " --host <host> --port <port> --mode <ping|crud|metadata|prepared>\n";
 }
 
 bool ParsePort(const std::string &value, int32_t &port_out) {
@@ -76,8 +77,8 @@ bool ParseArgs(int argc, char **argv, Options &options, std::string &error) {
 		error = "--port is required";
 		return false;
 	}
-	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata") {
-		error = "--mode must be ping, crud or metadata";
+	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata" && options.mode != "prepared") {
+		error = "--mode must be ping, crud, metadata or prepared";
 		return false;
 	}
 	return true;
@@ -167,6 +168,119 @@ Status ExecuteUpdate(FlightSqlClient &client, const std::string &query, std::opt
 		                      "] but got ", rows_changed);
 	}
 	return Status::OK();
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> BuildIntegerArray(const std::shared_ptr<arrow::DataType> &type,
+                                                                const std::vector<int64_t> &values) {
+	switch (type->id()) {
+	case arrow::Type::INT8: {
+		arrow::Int8Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<int8_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::INT16: {
+		arrow::Int16Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<int16_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::INT32: {
+		arrow::Int32Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<int32_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::INT64: {
+		arrow::Int64Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(value));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::UINT8: {
+		arrow::UInt8Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<uint8_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::UINT16: {
+		arrow::UInt16Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<uint16_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::UINT32: {
+		arrow::UInt32Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<uint32_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::UINT64: {
+		arrow::UInt64Builder builder;
+		for (auto value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(static_cast<uint64_t>(value)));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	default:
+		return Status::NotImplemented("unsupported integer parameter type: ", type->ToString());
+	}
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> BuildStringArray(const std::shared_ptr<arrow::DataType> &type,
+                                                               const std::vector<std::string> &values) {
+	switch (type->id()) {
+	case arrow::Type::STRING: {
+		arrow::StringBuilder builder;
+		for (auto &value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(value));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	case arrow::Type::LARGE_STRING: {
+		arrow::LargeStringBuilder builder;
+		for (auto &value : values) {
+			ARROW_RETURN_NOT_OK(builder.Append(value));
+		}
+		std::shared_ptr<arrow::Array> array;
+		ARROW_RETURN_NOT_OK(builder.Finish(&array));
+		return array;
+	}
+	default:
+		return Status::NotImplemented("unsupported string parameter type: ", type->ToString());
+	}
+}
+
+Status ClosePreparedStatement(const std::shared_ptr<PreparedStatement> &statement) {
+	if (!statement || statement->IsClosed()) {
+		return Status::OK();
+	}
+	return statement->Close();
 }
 
 Status RunPing(FlightSqlClient &client) {
@@ -410,6 +524,173 @@ Status RunMetadata(FlightSqlClient &client) {
 	return Status::OK();
 }
 
+Status RunPrepared(FlightSqlClient &client) {
+	std::vector<std::shared_ptr<PreparedStatement>> statements;
+	auto cleanup = [&]() {
+		for (auto &statement : statements) {
+			(void)ClosePreparedStatement(statement);
+		}
+		(void)ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_prep_it", std::nullopt);
+	};
+	auto fail_with_cleanup = [&](Status status) {
+		cleanup();
+		return status;
+	};
+
+	auto status = ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_prep_it", std::nullopt);
+	if (!status.ok()) {
+		return status;
+	}
+	status = ExecuteUpdate(client, "CREATE TABLE flight_prep_it (id INTEGER, val VARCHAR)", std::nullopt);
+	if (!status.ok()) {
+		return status;
+	}
+
+	auto prepared_insert_result = client.Prepare({}, "INSERT INTO flight_prep_it VALUES (?, ?)");
+	if (!prepared_insert_result.ok()) {
+		return fail_with_cleanup(prepared_insert_result.status());
+	}
+	auto prepared_insert = prepared_insert_result.MoveValueUnsafe();
+	statements.push_back(prepared_insert);
+	auto insert_schema = prepared_insert->parameter_schema();
+	if (!insert_schema || insert_schema->num_fields() != 2) {
+		return fail_with_cleanup(Status::Invalid("unexpected parameter schema for insert prepared statement"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto insert_id_array, BuildIntegerArray(insert_schema->field(0)->type(), {1, 2, 3}));
+	ARROW_ASSIGN_OR_RAISE(auto insert_val_array, BuildStringArray(insert_schema->field(1)->type(), {"a", "b", "c"}));
+	auto insert_batch = arrow::RecordBatch::Make(insert_schema, 3, {insert_id_array, insert_val_array});
+	status = prepared_insert->SetParameters(insert_batch);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+	auto insert_rows_result = prepared_insert->ExecuteUpdate({});
+	if (!insert_rows_result.ok()) {
+		return fail_with_cleanup(insert_rows_result.status());
+	}
+	if (insert_rows_result.ValueOrDie() != 3) {
+		return fail_with_cleanup(
+		    Status::Invalid("prepared insert expected 3 affected rows, got ", insert_rows_result.ValueOrDie()));
+	}
+	status = ClosePreparedStatement(prepared_insert);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+
+	auto prepared_update_result = client.Prepare({}, "UPDATE flight_prep_it SET val = ? WHERE id = ?");
+	if (!prepared_update_result.ok()) {
+		return fail_with_cleanup(prepared_update_result.status());
+	}
+	auto prepared_update = prepared_update_result.MoveValueUnsafe();
+	statements.push_back(prepared_update);
+	auto update_schema = prepared_update->parameter_schema();
+	if (!update_schema || update_schema->num_fields() != 2) {
+		return fail_with_cleanup(Status::Invalid("unexpected parameter schema for update prepared statement"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto update_val_array, BuildStringArray(update_schema->field(0)->type(), {"bb", "cc"}));
+	ARROW_ASSIGN_OR_RAISE(auto update_id_array, BuildIntegerArray(update_schema->field(1)->type(), {2, 3}));
+	auto update_batch = arrow::RecordBatch::Make(update_schema, 2, {update_val_array, update_id_array});
+	status = prepared_update->SetParameters(update_batch);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+	auto update_rows_result = prepared_update->ExecuteUpdate({});
+	if (!update_rows_result.ok()) {
+		return fail_with_cleanup(update_rows_result.status());
+	}
+	if (update_rows_result.ValueOrDie() != 2) {
+		return fail_with_cleanup(
+		    Status::Invalid("prepared update expected 2 affected rows, got ", update_rows_result.ValueOrDie()));
+	}
+	status = ClosePreparedStatement(prepared_update);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+
+	auto prepared_query_result = client.Prepare({}, "SELECT id, val FROM flight_prep_it WHERE id > ? ORDER BY id");
+	if (!prepared_query_result.ok()) {
+		return fail_with_cleanup(prepared_query_result.status());
+	}
+	auto prepared_query = prepared_query_result.MoveValueUnsafe();
+	statements.push_back(prepared_query);
+	auto query_schema = prepared_query->parameter_schema();
+	if (!query_schema || query_schema->num_fields() != 1) {
+		return fail_with_cleanup(Status::Invalid("unexpected parameter schema for query prepared statement"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto query_id_array, BuildIntegerArray(query_schema->field(0)->type(), {1}));
+	auto query_batch = arrow::RecordBatch::Make(query_schema, 1, {query_id_array});
+	status = prepared_query->SetParameters(query_batch);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+	auto query_info_result = prepared_query->Execute({});
+	if (!query_info_result.ok()) {
+		return fail_with_cleanup(query_info_result.status());
+	}
+	auto query_info = std::move(query_info_result).ValueOrDie();
+	auto query_table_result = FlightInfoToTable(client, std::move(query_info), "Prepared query");
+	if (!query_table_result.ok()) {
+		return fail_with_cleanup(query_table_result.status());
+	}
+	auto query_table = query_table_result.MoveValueUnsafe();
+	if (query_table->num_columns() != 2 || query_table->num_rows() != 2) {
+		return fail_with_cleanup(Status::Invalid("prepared query returned unexpected shape"));
+	}
+	if (query_table->column(0)->num_chunks() != 1 || query_table->column(1)->num_chunks() != 1) {
+		return fail_with_cleanup(Status::Invalid("prepared query returned unexpected chunking"));
+	}
+	const std::vector<int64_t> expected_ids = {2, 3};
+	const std::vector<std::string> expected_vals = {"bb", "cc"};
+	for (int64_t row = 0; row < 2; row++) {
+		ARROW_ASSIGN_OR_RAISE(auto id, GetIntValue(query_table->column(0)->chunk(0), row));
+		if (id != expected_ids[static_cast<size_t>(row)]) {
+			return fail_with_cleanup(Status::Invalid("unexpected id in prepared query result: ", id));
+		}
+		ARROW_ASSIGN_OR_RAISE(auto val, GetStringValue(query_table->column(1)->chunk(0), row));
+		if (val != expected_vals[static_cast<size_t>(row)]) {
+			return fail_with_cleanup(Status::Invalid("unexpected val in prepared query result: ", val));
+		}
+	}
+	status = ClosePreparedStatement(prepared_query);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+
+	auto prepared_multirow_query_result = client.Prepare({}, "SELECT ?::INTEGER AS x");
+	if (!prepared_multirow_query_result.ok()) {
+		return fail_with_cleanup(prepared_multirow_query_result.status());
+	}
+	auto prepared_multirow_query = prepared_multirow_query_result.MoveValueUnsafe();
+	statements.push_back(prepared_multirow_query);
+	auto multirow_query_schema = prepared_multirow_query->parameter_schema();
+	if (!multirow_query_schema || multirow_query_schema->num_fields() != 1) {
+		return fail_with_cleanup(
+		    Status::Invalid("unexpected parameter schema for single-row enforcement test"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto multirow_query_array,
+	                      BuildIntegerArray(multirow_query_schema->field(0)->type(), {1, 2}));
+	auto multirow_batch = arrow::RecordBatch::Make(multirow_query_schema, 2, {multirow_query_array});
+	status = prepared_multirow_query->SetParameters(multirow_batch);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+	auto multirow_exec_result = prepared_multirow_query->Execute({});
+	if (multirow_exec_result.ok()) {
+		return fail_with_cleanup(
+		    Status::Invalid("prepared query with multiple parameter rows unexpectedly succeeded"));
+	}
+	status = ClosePreparedStatement(prepared_multirow_query);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+
+	status = ExecuteUpdate(client, "DROP TABLE flight_prep_it", std::nullopt);
+	if (!status.ok()) {
+		return fail_with_cleanup(status);
+	}
+	cleanup();
+	return Status::OK();
+}
+
 Status RunMain(const Options &options) {
 	ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp(options.host, options.port));
 	ARROW_ASSIGN_OR_RAISE(auto client, FlightClient::Connect(location));
@@ -420,6 +701,8 @@ Status RunMain(const Options &options) {
 		status = RunPing(sql_client);
 	} else if (options.mode == "metadata") {
 		status = RunMetadata(sql_client);
+	} else if (options.mode == "prepared") {
+		status = RunPrepared(sql_client);
 	} else {
 		status = RunCrud(sql_client);
 	}
