@@ -26,11 +26,12 @@ var (
 )
 
 const (
-	benchmarkTable   = "go_flight_bench"
-	txBenchmarkTable = "go_flight_tx_bench"
-	crudTable        = "go_flight_crud_tmp"
-	driverName       = "flightsql"
-	driverTimeoutDSN = "120s"
+	benchmarkTable           = "go_flight_bench"
+	txBenchmarkTable         = "go_flight_tx_bench"
+	txConflictBenchmarkTable = "go_flight_tx_conflict_bench"
+	crudTable                = "go_flight_crud_tmp"
+	driverName               = "flightsql"
+	driverTimeoutDSN         = "120s"
 )
 
 type idRange struct {
@@ -108,6 +109,19 @@ func resetTransactionBenchmarkTable(db *sql.DB) error {
 			"id BIGINT PRIMARY KEY, " +
 			"worker_id BIGINT, " +
 			"val BIGINT)",
+	)
+	return err
+}
+
+func resetTransactionConflictBenchmarkTable(db *sql.DB) error {
+	if _, err := db.Exec("DROP TABLE IF EXISTS " + txConflictBenchmarkTable); err != nil {
+		return err
+	}
+	_, err := db.Exec(
+		"CREATE TABLE " + txConflictBenchmarkTable + " (" +
+			"id BIGINT PRIMARY KEY, " +
+			"worker_id BIGINT, " +
+			"attempt BIGINT)",
 	)
 	return err
 }
@@ -642,6 +656,216 @@ func runConcurrentTransactionCommitRollback(t *testing.T, db *sql.DB, rows, work
 	printRowMetric("concurrent_transactions_rolledback_rows", duration, expectedRolledBackRows)
 }
 
+func isExpectedConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "conflict") ||
+		strings.Contains(msg, "duplicate") ||
+		strings.Contains(msg, "constraint")
+}
+
+func runConcurrentTransactionCommitConflicts(t *testing.T, db *sql.DB, workers int) {
+	t.Helper()
+	requirePositiveFlag(t, workers, "workers")
+
+	printPhaseStart("CONCURRENT_TRANSACTIONS_COMMIT_CONFLICTS")
+	if err := resetTransactionConflictBenchmarkTable(db); err != nil {
+		t.Fatalf("reset transaction conflict benchmark table failed: %v", err)
+	}
+
+	for id := 1; id <= workers; id++ {
+		if _, err := db.Exec(
+			"INSERT INTO "+txConflictBenchmarkTable+" VALUES (?, ?, ?)",
+			id, -1, 0,
+		); err != nil {
+			t.Fatalf("seed conflict row failed for id=%d: %v", id, err)
+		}
+	}
+
+	errCh := make(chan error, workers*2)
+	var pairWG sync.WaitGroup
+	var committedCount atomic.Int64
+	var conflictCount atomic.Int64
+	start := time.Now()
+
+	for pairIdx := 0; pairIdx < workers; pairIdx++ {
+		pairWG.Add(1)
+		go func(pair int) {
+			defer pairWG.Done()
+
+			pairID := int64(pair + 1)
+			startUpdate := make(chan struct{})
+			startCommit := make(chan struct{})
+			beginReady := make(chan struct{}, 2)
+			var precommitReadyWG sync.WaitGroup
+			var contenderWG sync.WaitGroup
+			precommitReadyWG.Add(2)
+			contenderWG.Add(2)
+
+			runContender := func(contenderOffset int64) {
+				defer contenderWG.Done()
+				ctx := context.Background()
+				workerID := int64(pair*2) + contenderOffset
+
+				conn, err := db.Conn(ctx)
+				if err != nil {
+					errCh <- fmt.Errorf("pair=%d contender=%d acquire conn failed: %w", pair, contenderOffset, err)
+					precommitReadyWG.Done()
+					return
+				}
+				defer conn.Close()
+
+				tx, err := conn.BeginTx(ctx, nil)
+				if err != nil {
+					errCh <- fmt.Errorf("pair=%d contender=%d begin tx failed: %w", pair, contenderOffset, err)
+					precommitReadyWG.Done()
+					return
+				}
+
+				beginReady <- struct{}{}
+				<-startUpdate
+				_, updateErr := tx.ExecContext(
+					ctx,
+					"UPDATE "+txConflictBenchmarkTable+" SET worker_id = ?, attempt = attempt + 1 WHERE id = ?",
+					workerID, pairID,
+				)
+				if updateErr != nil {
+					if isExpectedConflictError(updateErr) {
+						conflictCount.Add(1)
+						_ = tx.Rollback()
+						precommitReadyWG.Done()
+						return
+					}
+					_ = tx.Rollback()
+					errCh <- fmt.Errorf("pair=%d contender=%d update failed: %w", pair, contenderOffset, updateErr)
+					precommitReadyWG.Done()
+					return
+				}
+
+				var inTxAttempt int64
+				if err := tx.QueryRowContext(
+					ctx,
+					"SELECT CAST(attempt AS BIGINT) FROM "+txConflictBenchmarkTable+" WHERE id = ?",
+					pairID,
+				).Scan(&inTxAttempt); err != nil {
+					_ = tx.Rollback()
+					errCh <- fmt.Errorf("pair=%d contender=%d in-tx attempt query failed: %w", pair, contenderOffset, err)
+					precommitReadyWG.Done()
+					return
+				}
+				if inTxAttempt != 1 {
+					_ = tx.Rollback()
+					errCh <- fmt.Errorf("pair=%d contender=%d in-tx attempt mismatch: got=%d expected=1", pair, contenderOffset, inTxAttempt)
+					precommitReadyWG.Done()
+					return
+				}
+
+				precommitReadyWG.Done()
+				<-startCommit
+				if err := tx.Commit(); err != nil {
+					if isExpectedConflictError(err) {
+						conflictCount.Add(1)
+						return
+					}
+					errCh <- fmt.Errorf("pair=%d contender=%d commit failed: %w", pair, contenderOffset, err)
+					return
+				}
+				committedCount.Add(1)
+			}
+
+			go runContender(0)
+			go runContender(1)
+
+			<-beginReady
+			<-beginReady
+			close(startUpdate)
+			precommitReadyWG.Wait()
+
+			var outsideAttempt int64
+			var outsideWorker int64
+			if err := db.QueryRow(
+				"SELECT CAST(attempt AS BIGINT), CAST(worker_id AS BIGINT) FROM "+txConflictBenchmarkTable+" WHERE id = ?",
+				pairID,
+			).Scan(&outsideAttempt, &outsideWorker); err != nil {
+				errCh <- fmt.Errorf("pair=%d outside pre-commit query failed: %w", pair, err)
+				close(startCommit)
+				contenderWG.Wait()
+				return
+			}
+			if outsideAttempt != 0 || outsideWorker != -1 {
+				errCh <- fmt.Errorf("pair=%d outside pre-commit state mismatch: attempt=%d worker_id=%d expected attempt=0 worker_id=-1",
+					pair, outsideAttempt, outsideWorker)
+				close(startCommit)
+				contenderWG.Wait()
+				return
+			}
+
+			close(startCommit)
+			contenderWG.Wait()
+		}(pairIdx)
+	}
+
+	pairWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent transaction commit conflict benchmark failed: %v", err)
+		}
+	}
+
+	commits := committedCount.Load()
+	conflicts := conflictCount.Load()
+	expectedCommits := int64(workers)
+	expectedConflicts := int64(workers)
+	if commits != expectedCommits {
+		t.Fatalf("commit conflict benchmark expected %d committed tx, got=%d", expectedCommits, commits)
+	}
+	if conflicts != expectedConflicts {
+		t.Fatalf("commit conflict benchmark expected %d conflict failures, got=%d", expectedConflicts, conflicts)
+	}
+
+	var finalCountRaw any
+	var finalAttemptSumRaw any
+	var finalWinnerCountRaw any
+	if err := db.QueryRow(
+		"SELECT "+
+			"CAST(COUNT(*) AS BIGINT), "+
+			"CAST(COALESCE(SUM(attempt), 0) AS BIGINT), "+
+			"CAST(COALESCE(SUM(CASE WHEN worker_id >= 0 THEN 1 ELSE 0 END), 0) AS BIGINT) "+
+			"FROM "+txConflictBenchmarkTable,
+	).Scan(&finalCountRaw, &finalAttemptSumRaw, &finalWinnerCountRaw); err != nil {
+		t.Fatalf("final conflict aggregate query failed: %v", err)
+	}
+	finalCount, err := toInt64(finalCountRaw, "final_count")
+	if err != nil {
+		t.Fatalf("final conflict final_count conversion failed: %v", err)
+	}
+	finalAttemptSum, err := toInt64(finalAttemptSumRaw, "final_attempt_sum")
+	if err != nil {
+		t.Fatalf("final conflict final_attempt_sum conversion failed: %v", err)
+	}
+	finalWinnerCount, err := toInt64(finalWinnerCountRaw, "final_winner_count")
+	if err != nil {
+		t.Fatalf("final conflict final_winner_count conversion failed: %v", err)
+	}
+	if finalCount != int64(workers) {
+		t.Fatalf("final conflict table count mismatch: got=%d expected=%d", finalCount, workers)
+	}
+	if finalAttemptSum != int64(workers) {
+		t.Fatalf("final conflict attempt sum mismatch: got=%d expected=%d", finalAttemptSum, workers)
+	}
+	if finalWinnerCount != int64(workers) {
+		t.Fatalf("final conflict winner count mismatch: got=%d expected=%d", finalWinnerCount, workers)
+	}
+
+	duration := time.Since(start)
+	printOpMetric("concurrent_tx_conflict_total", duration, int64(workers*2))
+	printOpMetric("concurrent_tx_conflict_commits", duration, commits)
+	printOpMetric("concurrent_tx_conflict_failures", duration, conflicts)
+}
+
 func runOrderedSingleRead(t *testing.T, db *sql.DB, rows int) {
 	t.Helper()
 	requirePositiveFlag(t, rows, "rows")
@@ -859,6 +1083,7 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	runBatchInsert(t, db, *flagRows, *flagBatchSize)
 	runConcurrentInsert(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCommitRollback(t, db, *flagRows, *flagWorkers)
+	runConcurrentTransactionCommitConflicts(t, db, *flagWorkers)
 	runOrderedSingleRead(t, db, *flagRows)
 	runOrderedConcurrentRead(t, db, *flagRows, *flagWorkers)
 	runOrderedConcurrentFullRead(t, db, *flagRows, *flagWorkers)
