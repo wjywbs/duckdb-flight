@@ -559,6 +559,78 @@ func runOrderedConcurrentRead(t *testing.T, db *sql.DB, rows, workers int) {
 	printRowMetric("select_ordered_concurrent_rows", duration, int64(rows))
 }
 
+func runOrderedConcurrentFullRead(t *testing.T, db *sql.DB, rows, workers int) {
+	t.Helper()
+	requirePositiveFlag(t, rows, "rows")
+	requirePositiveFlag(t, workers, "workers")
+
+	printPhaseStart("SELECT_ORDERED_CONCURRENT_FULL_200")
+	errCh := make(chan error, workers)
+	var verifiedRows atomic.Int64
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for workerID := 0; workerID < workers; workerID++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			queryRows, err := db.Query("SELECT id, val FROM " + benchmarkTable + " ORDER BY id")
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d query failed: %w", worker, err)
+				return
+			}
+			defer queryRows.Close()
+
+			expectedID := int64(1)
+			var localCount int64
+			for queryRows.Next() {
+				var id int64
+				var val int64
+				if err := queryRows.Scan(&id, &val); err != nil {
+					errCh <- fmt.Errorf("worker=%d scan failed: %w", worker, err)
+					return
+				}
+				if id != expectedID {
+					errCh <- fmt.Errorf("worker=%d id mismatch: got=%d expected=%d", worker, id, expectedID)
+					return
+				}
+				ev := expectedVal(id)
+				if val != ev {
+					errCh <- fmt.Errorf("worker=%d val mismatch for id=%d: got=%d expected=%d", worker, id, val, ev)
+					return
+				}
+				expectedID++
+				localCount++
+			}
+			if err := queryRows.Err(); err != nil {
+				errCh <- fmt.Errorf("worker=%d rows iteration failed: %w", worker, err)
+				return
+			}
+			if localCount != int64(rows) {
+				errCh <- fmt.Errorf("worker=%d row count mismatch: got=%d expected=%d", worker, localCount, rows)
+				return
+			}
+			verifiedRows.Add(localCount)
+		}(workerID)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent full ordered read failed: %v", err)
+		}
+	}
+
+	expectedTotal := int64(rows) * int64(workers)
+	total := verifiedRows.Load()
+	if total != expectedTotal {
+		t.Fatalf("concurrent full ordered read total mismatch: got=%d expected=%d", total, expectedTotal)
+	}
+	duration := time.Since(start)
+	printRowMetric("select_ordered_concurrent_full_rows", duration, total)
+}
+
 func TestPing(t *testing.T) {
 	db := openDB(t)
 	defer db.Close()
@@ -586,4 +658,5 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	runConcurrentInsert(t, db, *flagRows, *flagWorkers)
 	runOrderedSingleRead(t, db, *flagRows)
 	runOrderedConcurrentRead(t, db, *flagRows, *flagWorkers)
+	runOrderedConcurrentFullRead(t, db, *flagRows, *flagWorkers)
 }
