@@ -1,6 +1,7 @@
 package goflightbench
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -373,7 +374,8 @@ func runConcurrentInsert(t *testing.T, db *sql.DB, rows, workers int) {
 	requirePositiveFlag(t, rows, "rows")
 	requirePositiveFlag(t, workers, "workers")
 
-	printPhaseStart("CONCURRENT_INSERT_200")
+	// Use one tx + prepared statement per worker to avoid autocommit-per-row contention.
+	printPhaseStart("CONCURRENT_INSERT_200_TX_PREPARED")
 	if err := resetBenchmarkTable(db); err != nil {
 		t.Fatalf("reset benchmark table failed: %v", err)
 	}
@@ -390,11 +392,37 @@ func runConcurrentInsert(t *testing.T, db *sql.DB, rows, workers int) {
 		wg.Add(1)
 		go func(worker int, r idRange) {
 			defer wg.Done()
+			ctx := context.Background()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d acquire conn failed: %w", worker, err)
+				return
+			}
+			defer conn.Close()
+
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d begin tx failed: %w", worker, err)
+				return
+			}
+			stmt, err := tx.PrepareContext(ctx, "INSERT INTO "+benchmarkTable+" VALUES (?, ?)")
+			if err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d prepare failed: %w", worker, err)
+				return
+			}
+			defer stmt.Close()
+
 			for id := r.start; id <= r.end; id++ {
-				if _, err := db.Exec("INSERT INTO "+benchmarkTable+" VALUES (?, ?)", id, expectedVal(id)); err != nil {
+				if _, err := stmt.ExecContext(ctx, id, expectedVal(id)); err != nil {
+					_ = tx.Rollback()
 					errCh <- fmt.Errorf("worker=%d id=%d insert failed: %w", worker, id, err)
 					return
 				}
+			}
+			if err := tx.Commit(); err != nil {
+				errCh <- fmt.Errorf("worker=%d commit failed: %w", worker, err)
+				return
 			}
 		}(workerID, rg)
 	}
@@ -409,7 +437,7 @@ func runConcurrentInsert(t *testing.T, db *sql.DB, rows, workers int) {
 	duration := time.Since(phaseStart)
 	verifyAggregateTableState(t, db, int64(rows))
 	printRowMetric("concurrent_insert_rows", duration, int64(rows))
-	printOpMetric("concurrent_insert_autocommit_ops", duration, int64(rows))
+	printOpMetric("concurrent_insert_tx_prepared_ops", duration, int64(rows))
 }
 
 func runOrderedSingleRead(t *testing.T, db *sql.DB, rows int) {
