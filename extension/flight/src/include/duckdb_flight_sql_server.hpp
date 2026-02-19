@@ -109,7 +109,6 @@ private:
 	std::atomic<int64_t> transaction_timeout_seconds {1800};
 	std::atomic<bool> sweeper_stopping {false};
 	std::atomic<bool> flight_sql_state_started {false};
-	std::atomic<bool> flight_sql_state_shutdown {false};
 	std::condition_variable sweeper_cv;
 	mutable std::mutex sweeper_cv_mutex;
 	std::thread sweeper_thread;
