@@ -45,6 +45,7 @@ std::string FlightService::Start(DatabaseInstance &db_instance, uint16_t port) {
 	if (!status.ok()) {
 		throw IOException("Failed to initialize Flight SQL server: %s", status.ToString());
 	}
+	server_instance->StartFlightSqlState();
 
 	server = std::move(server_instance);
 	location = server->location().ToString();
@@ -75,14 +76,20 @@ std::string FlightService::Stop() {
 		location.clear();
 	}
 
+	arrow::Status shutdown_status = arrow::Status::OK();
+	arrow::Status cleanup_status = arrow::Status::OK();
 	if (to_stop) {
-		auto shutdown_status = to_stop->Shutdown();
-		if (!shutdown_status.ok()) {
-			throw IOException("Failed to stop Flight SQL server: %s", shutdown_status.ToString());
-		}
+		shutdown_status = to_stop->Shutdown();
+		cleanup_status = to_stop->ShutdownFlightSqlState();
 	}
 	if (thread) {
 		thread->join();
+	}
+	if (!shutdown_status.ok()) {
+		throw IOException("Failed to stop Flight SQL server: %s", shutdown_status.ToString());
+	}
+	if (!cleanup_status.ok()) {
+		throw IOException("Failed to cleanup Flight SQL server state: %s", cleanup_status.ToString());
 	}
 	return StringUtil::Format("Flight SQL server stopped (%s)", old_location);
 }
@@ -104,6 +111,10 @@ std::string FlightService::SetTransactionTimeoutSeconds(int64_t timeout_seconds)
 }
 
 int64_t FlightService::GetTransactionTimeoutSeconds() const {
+	std::lock_guard<std::mutex> guard(lock);
+	if (server) {
+		return server->GetTransactionTimeoutSeconds();
+	}
 	return transaction_timeout_seconds.load(std::memory_order_relaxed);
 }
 

@@ -24,6 +24,8 @@ class DuckDBFlightSqlServer : public arrow::flight::sql::FlightSqlServerBase {
 public:
 	explicit DuckDBFlightSqlServer(shared_ptr<DatabaseInstance> db_instance);
 	~DuckDBFlightSqlServer() override;
+	void StartFlightSqlState();
+	arrow::Status ShutdownFlightSqlState();
 
 	void SetTransactionTimeoutSeconds(int64_t timeout_seconds);
 	int64_t GetTransactionTimeoutSeconds() const;
@@ -106,6 +108,8 @@ private:
 	std::atomic<uint64_t> transaction_counter {0};
 	std::atomic<int64_t> transaction_timeout_seconds {1800};
 	std::atomic<bool> sweeper_stopping {false};
+	std::atomic<bool> flight_sql_state_started {false};
+	std::atomic<bool> flight_sql_state_shutdown {false};
 	std::condition_variable sweeper_cv;
 	mutable std::mutex sweeper_cv_mutex;
 	std::thread sweeper_thread;
@@ -127,22 +131,17 @@ private:
 
 	arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>> ResultToFlightStream(
 	    unique_ptr<QueryResult> result, idx_t batch_size = 2048);
-	arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>> ResultToLockedFlightStream(
-	    std::shared_ptr<TransactionState> transaction_state, unique_ptr<QueryResult> result,
-	    std::unique_lock<std::shared_mutex> transaction_lock, idx_t batch_size = 2048);
 	arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>> StreamSQL(const std::string &sql,
 	                                                                           idx_t batch_size = 2048);
 	arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>> StreamSQLInTransaction(
 	    std::shared_ptr<TransactionState> transaction_state, const std::string &sql, idx_t batch_size = 2048);
 
 	void UpdateTransactionSqlInfo();
-	void TouchTransaction(const std::shared_ptr<TransactionState> &transaction_state);
 	arrow::Result<unique_ptr<QueryResult>> QueryInTransaction(const std::shared_ptr<TransactionState> &transaction_state,
 	                                                          const std::string &sql, bool streaming);
-	arrow::Status FinalizeTransaction(const std::shared_ptr<TransactionState> &transaction_state, bool commit,
-	                                  std::vector<uint64_t> &owned_prepared_handles);
+	arrow::Status FinalizeTransaction(const std::shared_ptr<TransactionState> &transaction_state, bool commit);
 	arrow::Status RemovePreparedStatement(uint64_t handle_id, bool error_if_missing);
-	void RemovePreparedStatements(const std::vector<uint64_t> &handle_ids);
+	void RemovePreparedStatements(const std::unordered_set<uint64_t> &handle_ids);
 	void StartTransactionSweeper();
 	void StopTransactionSweeper();
 	void RunTransactionSweeper();
