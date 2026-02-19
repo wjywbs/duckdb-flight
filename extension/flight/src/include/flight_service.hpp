@@ -1,21 +1,16 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
 #include "duckdb.hpp"
 
-namespace arrow {
-namespace flight {
-namespace sql {
-class FlightSqlServerBase;
-} // namespace sql
-} // namespace flight
-} // namespace arrow
-
 namespace duckdb {
 namespace flight {
+
+class DuckDBFlightSqlServer;
 
 class FlightService {
 public:
@@ -23,6 +18,8 @@ public:
 
 	std::string Start(DatabaseInstance &db_instance, uint16_t port);
 	std::string Stop();
+	std::string SetTransactionTimeoutSeconds(int64_t timeout_seconds);
+	int64_t GetTransactionTimeoutSeconds() const;
 	bool IsStarted() const;
 	std::string Location() const;
 
@@ -34,10 +31,11 @@ private:
 	FlightService &operator=(const FlightService &) = delete;
 
 	mutable std::mutex lock;
-	std::shared_ptr<arrow::flight::sql::FlightSqlServerBase> server;
+	std::shared_ptr<DuckDBFlightSqlServer> server;
 	std::unique_ptr<std::thread> server_thread;
 	std::string location;
 	std::atomic<bool> started {false};
+	std::atomic<int64_t> transaction_timeout_seconds {1800};
 };
 
 } // namespace flight
