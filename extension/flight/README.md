@@ -26,3 +26,11 @@ SELECT * FROM get_flight_sql_url();
 ```
 
 `-flight-sql` runs as a daemon mode (non-interactive shell) and exits on Ctrl-C.
+
+## Go Benchmark Client
+
+A standalone Go benchmark client is available in `extension/flight/test/go`.
+
+```sh
+extension/flight/test/go/run_flight_go_bench.sh
+```
