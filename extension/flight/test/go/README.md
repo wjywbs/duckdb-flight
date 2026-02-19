@@ -47,6 +47,7 @@ The script:
 - Batch insert of 100k rows
 - 200-goroutine concurrent insert (per-worker transaction + prepared statement)
 - Concurrent transaction commit/rollback benchmark with visibility checks
+- Concurrent transaction DDL+DML benchmark (create/drop + insert/select in one tx)
 - Concurrent transaction commit-conflict benchmark (pairwise same-row update conflicts)
 - Ordered single-reader scan of 100k rows with correctness checks
 - Ordered concurrent shard scans with correctness checks
@@ -67,6 +68,37 @@ Phase: `CONCURRENT_TRANSACTIONS_COMMIT_ROLLBACK`
   - committed worker rows must persist
   - rolled-back worker rows must not persist
 - Final aggregate checks validate committed row count, distinct id count, and sum.
+
+## Concurrent Transaction DDL+DML Benchmark
+
+Phase: `CONCURRENT_TRANSACTIONS_DDL_DML`
+
+Scenario design:
+
+- Each worker runs one transaction that performs:
+  - `CREATE TABLE <worker_unique_table>(...)`
+  - insert worker shard rows into that worker table
+  - in-transaction `SELECT COUNT/SUM` from that worker table
+  - `DROP TABLE <worker_unique_table>`
+  - `COMMIT`
+
+Correctness checks:
+
+- During transaction:
+  - outside query cannot see uncommitted DDL table,
+  - in-tx aggregate count/sum matches inserted rows for that worker table,
+  - dropped table is no longer queryable inside tx.
+- After commit:
+  - dropped DDL tables do not exist,
+  - no leftover worker DDL tables by prefix,
+  - total inserted/selected row accounting equals `rows`.
+
+Debug finding (why this was unreliable):
+
+- In Arrow Go Flight SQL driver `v18.5.1`, `Connection.QueryContext` runs direct `client.Execute(...)` and does not branch on active `c.txn` for zero-argument queries.
+- `database/sql` may route `tx.QueryRowContext` with no parameters through that path, so a query can execute outside the transaction.
+- That explains the intermittent behavior where `BEGIN; CREATE TABLE ...; INSERT ...; SELECT ...` on tx-local tables failed in this benchmark while DuckDB CLI sequence worked.
+- Workaround used here: in-tx select is parameterized (`WHERE id >= ?`) so database/sql uses prepared statement execution, which is transaction-bound in the driver.
 
 ## Concurrent Transaction Commit-Conflict Benchmark
 
@@ -102,6 +134,9 @@ From a default 100k-row run on this environment:
 - `concurrent_transactions_total` (200 workers mixed commit/rollback): ~3.71s for 200 tx (~54 tx/s)
   - committed rows: `50000`
   - rolled-back rows: `50000`
+- `concurrent_tx_ddl_dml_total` (200 workers, create/drop + insert/select): ~3.30s for 200 tx (~60.6 tx/s)
+  - inserted rows: `100000`
+  - selected rows: `100000`
 - `concurrent_tx_conflict_total` (pairwise conflicts, 200 workers => 400 tx): ~0.20s for 400 tx (~2005 tx/s)
   - commits: `200`
   - conflict failures: `200`
