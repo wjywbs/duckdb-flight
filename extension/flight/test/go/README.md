@@ -46,11 +46,26 @@ The script:
 - CRUD single-operation autocommit timing
 - Batch insert of 100k rows
 - 200-goroutine concurrent insert (per-worker transaction + prepared statement)
+- Concurrent transaction commit/rollback benchmark with visibility checks
 - Ordered single-reader scan of 100k rows with correctness checks
 - Ordered concurrent shard scans with correctness checks
 - Ordered concurrent full-table scans with correctness checks (no sharding)
 
 This benchmark path is script-driven and not part of default pytest/CI runs.
+
+## Concurrent Transaction Benchmark
+
+Phase: `CONCURRENT_TRANSACTIONS_COMMIT_ROLLBACK`
+
+- Workers run independent transactions concurrently.
+- Even worker ids commit; odd worker ids rollback.
+- During each transaction:
+  - in-transaction query must see all rows inserted by that worker
+  - outside query must not see that worker's uncommitted rows
+- After transaction end:
+  - committed worker rows must persist
+  - rolled-back worker rows must not persist
+- Final aggregate checks validate committed row count, distinct id count, and sum.
 
 ## Latest Results (Analysis)
 
@@ -60,6 +75,9 @@ From a default 100k-row run on this environment:
 - `concurrent_insert_rows`:
   - before fix (200 goroutines, autocommit row-by-row): ~35.64s (~2.81k rows/s)
   - after fix (200 goroutines, per-worker transaction + prepared statement): ~3.5-3.8s (~26k-29k rows/s)
+- `concurrent_transactions_total` (200 workers mixed commit/rollback): ~3.71s for 200 tx (~54 tx/s)
+  - committed rows: `50000`
+  - rolled-back rows: `50000`
 - `select_ordered_single_rows`: ~18-19ms
 - `select_ordered_concurrent_rows`: ~40-46ms
 
