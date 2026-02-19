@@ -47,6 +47,7 @@ The script:
 - Batch insert of 100k rows
 - 200-goroutine concurrent insert (per-worker transaction + prepared statement)
 - Concurrent transaction commit/rollback benchmark with visibility checks
+- Concurrent transaction commit-conflict benchmark (pairwise same-row update conflicts)
 - Ordered single-reader scan of 100k rows with correctness checks
 - Ordered concurrent shard scans with correctness checks
 - Ordered concurrent full-table scans with correctness checks (no sharding)
@@ -67,6 +68,29 @@ Phase: `CONCURRENT_TRANSACTIONS_COMMIT_ROLLBACK`
   - rolled-back worker rows must not persist
 - Final aggregate checks validate committed row count, distinct id count, and sum.
 
+## Concurrent Transaction Commit-Conflict Benchmark
+
+Phase: `CONCURRENT_TRANSACTIONS_COMMIT_CONFLICTS`
+
+Commit-conflict scenario design:
+
+- Seed `workers` rows in `go_flight_tx_conflict_bench` with `(id, worker_id=-1, attempt=0)`.
+- For each `id`, run 2 concurrent contenders (2 transactions) that both:
+  - `BEGIN`
+  - `UPDATE go_flight_tx_conflict_bench SET worker_id=?, attempt=attempt+1 WHERE id=?`
+  - wait at a barrier
+  - `COMMIT`
+- This creates deterministic write-write contention per row (one winner, one conflict loser).
+
+Correctness checks:
+
+- During transaction (before commit barrier release): outside query must still see `attempt=0, worker_id=-1` for each row.
+- During transaction (inside tx after update): contender sees `attempt=1` for that row.
+- After transactions:
+  - exactly `workers` commits and `workers` conflict failures (for `2*workers` transactions total),
+  - table row count remains `workers`,
+  - `SUM(attempt) = workers` and winner row count is `workers` (exactly one committed update per row).
+
 ## Latest Results (Analysis)
 
 From a default 100k-row run on this environment:
@@ -78,6 +102,9 @@ From a default 100k-row run on this environment:
 - `concurrent_transactions_total` (200 workers mixed commit/rollback): ~3.71s for 200 tx (~54 tx/s)
   - committed rows: `50000`
   - rolled-back rows: `50000`
+- `concurrent_tx_conflict_total` (pairwise conflicts, 200 workers => 400 tx): ~0.20s for 400 tx (~2005 tx/s)
+  - commits: `200`
+  - conflict failures: `200`
 - `select_ordered_single_rows`: ~18-19ms
 - `select_ordered_concurrent_rows`: ~40-46ms
 
