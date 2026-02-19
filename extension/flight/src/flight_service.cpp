@@ -32,6 +32,7 @@ std::string FlightService::Start(DatabaseInstance &db_instance, uint16_t port) {
 
 	auto db_ref = db_instance.shared_from_this();
 	auto server_instance = std::make_shared<DuckDBFlightSqlServer>(std::move(db_ref));
+	server_instance->SetTransactionTimeoutSeconds(transaction_timeout_seconds.load(std::memory_order_relaxed));
 
 	auto location_result = arrow::flight::Location::ForGrpcTcp("0.0.0.0", static_cast<int>(port));
 	if (!location_result.ok()) {
@@ -58,7 +59,7 @@ std::string FlightService::Start(DatabaseInstance &db_instance, uint16_t port) {
 }
 
 std::string FlightService::Stop() {
-	std::shared_ptr<arrow::flight::sql::FlightSqlServerBase> to_stop;
+	std::shared_ptr<DuckDBFlightSqlServer> to_stop;
 	std::unique_ptr<std::thread> thread;
 	std::string old_location;
 	{
@@ -84,6 +85,26 @@ std::string FlightService::Stop() {
 		thread->join();
 	}
 	return StringUtil::Format("Flight SQL server stopped (%s)", old_location);
+}
+
+std::string FlightService::SetTransactionTimeoutSeconds(int64_t timeout_seconds) {
+	if (timeout_seconds < 0) {
+		throw InvalidInputException("Transaction timeout must be >= 0 seconds");
+	}
+	std::lock_guard<std::mutex> guard(lock);
+	transaction_timeout_seconds.store(timeout_seconds, std::memory_order_relaxed);
+	if (server) {
+		server->SetTransactionTimeoutSeconds(timeout_seconds);
+	}
+	if (timeout_seconds == 0) {
+		return "Flight SQL transaction timeout disabled";
+	}
+	return StringUtil::Format("Flight SQL transaction timeout set to %lld seconds",
+	                          static_cast<long long>(timeout_seconds));
+}
+
+int64_t FlightService::GetTransactionTimeoutSeconds() const {
+	return transaction_timeout_seconds.load(std::memory_order_relaxed);
 }
 
 bool FlightService::IsStarted() const {

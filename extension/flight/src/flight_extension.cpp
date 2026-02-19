@@ -37,6 +37,13 @@ static unique_ptr<FunctionData> BoolResultBind(ClientContext &, TableFunctionBin
 	return nullptr;
 }
 
+static unique_ptr<FunctionData> BigIntResultBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
+                                                 vector<string> &names) {
+	types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("timeout_seconds");
+	return nullptr;
+}
+
 struct StartBindData : public FunctionData {
 	explicit StartBindData(uint16_t port_p) : port(port_p) {
 	}
@@ -47,6 +54,19 @@ struct StartBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		return port == other_p.Cast<StartBindData>().port;
+	}
+};
+
+struct TimeoutBindData : public FunctionData {
+	explicit TimeoutBindData(int64_t timeout_seconds_p) : timeout_seconds(timeout_seconds_p) {
+	}
+	int64_t timeout_seconds;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<TimeoutBindData>(timeout_seconds);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		return timeout_seconds == other_p.Cast<TimeoutBindData>().timeout_seconds;
 	}
 };
 
@@ -69,6 +89,23 @@ static unique_ptr<FunctionData> StartWithPortBind(ClientContext &, TableFunction
 	}
 	auto port = input.inputs[0].GetValue<uint16_t>();
 	return make_uniq<StartBindData>(port);
+}
+
+static unique_ptr<FunctionData> SetTransactionTimeoutBind(ClientContext &, TableFunctionBindInput &input,
+                                                          vector<LogicalType> &types, vector<string> &names) {
+	types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("status");
+	if (input.inputs.empty()) {
+		throw InvalidInputException("set_flight_sql_transaction_timeout_seconds(seconds) requires an argument");
+	}
+	if (input.inputs[0].IsNull()) {
+		throw InvalidInputException("Transaction timeout cannot be NULL");
+	}
+	auto timeout_seconds = input.inputs[0].GetValue<int64_t>();
+	if (timeout_seconds < 0) {
+		throw InvalidInputException("Transaction timeout must be >= 0 seconds");
+	}
+	return make_uniq<TimeoutBindData>(timeout_seconds);
 }
 
 static void StartFlightSQLServerFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -107,6 +144,25 @@ static void GetFlightSQLURLFunction(ClientContext & /*context*/, TableFunctionIn
 	output.SetValue(0, 0, url);
 }
 
+static void SetTransactionTimeoutFunction(ClientContext & /*context*/, TableFunctionInput &input, DataChunk &output) {
+	if (!ShouldRun(input)) {
+		return;
+	}
+	auto timeout_seconds = input.bind_data->Cast<TimeoutBindData>().timeout_seconds;
+	auto status = flight::FlightService::Get().SetTransactionTimeoutSeconds(timeout_seconds);
+	output.SetCardinality(1);
+	output.SetValue(0, 0, status);
+}
+
+static void GetTransactionTimeoutFunction(ClientContext & /*context*/, TableFunctionInput &input, DataChunk &output) {
+	if (!ShouldRun(input)) {
+		return;
+	}
+	auto timeout_seconds = flight::FlightService::Get().GetTransactionTimeoutSeconds();
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(timeout_seconds));
+}
+
 static void RegisterFunctions(ExtensionLoader &loader) {
 	auto start_no_arg =
 	    TableFunction("start_flight_sql_server", {}, StartFlightSQLServerFunction, StartNoArgBind, RunOnceState::Init);
@@ -126,6 +182,14 @@ static void RegisterFunctions(ExtensionLoader &loader) {
 
 	auto url = TableFunction("get_flight_sql_url", {}, GetFlightSQLURLFunction, StringResultBind, RunOnceState::Init);
 	loader.RegisterFunction(url);
+
+	auto set_timeout = TableFunction("set_flight_sql_transaction_timeout_seconds", {LogicalType::BIGINT},
+	                                 SetTransactionTimeoutFunction, SetTransactionTimeoutBind, RunOnceState::Init);
+	loader.RegisterFunction(set_timeout);
+
+	auto get_timeout = TableFunction("get_flight_sql_transaction_timeout_seconds", {}, GetTransactionTimeoutFunction,
+	                                 BigIntResultBind, RunOnceState::Init);
+	loader.RegisterFunction(get_timeout);
 }
 
 } // namespace

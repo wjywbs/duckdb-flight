@@ -23,6 +23,7 @@ using arrow::flight::FlightClient;
 using arrow::flight::Location;
 using arrow::flight::sql::FlightSqlClient;
 using arrow::flight::sql::PreparedStatement;
+using arrow::flight::sql::Transaction;
 namespace flight_sql_pb = arrow::flight::protocol::sql;
 
 namespace {
@@ -34,7 +35,8 @@ struct Options {
 };
 
 void PrintUsage(const char *program_name) {
-	std::cerr << "Usage: " << program_name << " --host <host> --port <port> --mode <ping|crud|metadata|prepared>\n";
+	std::cerr << "Usage: " << program_name
+	          << " --host <host> --port <port> --mode <ping|crud|metadata|prepared|transaction>\n";
 }
 
 bool ParsePort(const std::string &value, int32_t &port_out) {
@@ -84,8 +86,9 @@ bool ParseArgs(int argc, char **argv, Options &options, std::string &error) {
 		error = "--port is required";
 		return false;
 	}
-	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata" && options.mode != "prepared") {
-		error = "--mode must be ping, crud, metadata or prepared";
+	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata" && options.mode != "prepared" &&
+	    options.mode != "transaction") {
+		error = "--mode must be ping, crud, metadata, prepared or transaction";
 		return false;
 	}
 	return true;
@@ -158,6 +161,17 @@ arrow::Result<std::shared_ptr<arrow::Table>> ExecuteQuery(FlightSqlClient &clien
 	return table->CombineChunks();
 }
 
+arrow::Result<std::shared_ptr<arrow::Table>> ExecuteQueryInTransaction(FlightSqlClient &client, const std::string &query,
+                                                                        const Transaction &transaction) {
+	ARROW_ASSIGN_OR_RAISE(auto info, client.Execute({}, query, transaction));
+	if (info->endpoints().empty()) {
+		return Status::Invalid("no endpoints returned for query: ", query);
+	}
+	ARROW_ASSIGN_OR_RAISE(auto stream, client.DoGet({}, info->endpoints()[0].ticket));
+	ARROW_ASSIGN_OR_RAISE(auto table, stream->ToTable());
+	return table->CombineChunks();
+}
+
 arrow::Result<std::shared_ptr<arrow::Table>> FlightInfoToTable(FlightSqlClient &client, std::unique_ptr<arrow::flight::FlightInfo> info,
                                                                 const std::string &context) {
 	if (!info || info->endpoints().empty()) {
@@ -175,6 +189,24 @@ Status ExecuteUpdate(FlightSqlClient &client, const std::string &query, std::opt
 		                      "] but got ", rows_changed);
 	}
 	return Status::OK();
+}
+
+Status ExecuteUpdateInTransaction(FlightSqlClient &client, const std::string &query, const Transaction &transaction,
+                                  std::optional<int64_t> expected_rows_changed) {
+	ARROW_ASSIGN_OR_RAISE(auto rows_changed, client.ExecuteUpdate({}, query, transaction));
+	if (expected_rows_changed.has_value() && rows_changed != expected_rows_changed.value()) {
+		return Status::Invalid("expected ", expected_rows_changed.value(), " rows changed for query [", query,
+		                      "] but got ", rows_changed);
+	}
+	return Status::OK();
+}
+
+arrow::Result<int64_t> QueryCount(FlightSqlClient &client, const std::string &query) {
+	ARROW_ASSIGN_OR_RAISE(auto table, ExecuteQuery(client, query));
+	if (table->num_columns() != 1 || table->num_rows() != 1 || table->column(0)->num_chunks() != 1) {
+		return Status::Invalid("count query returned unexpected shape");
+	}
+	return GetIntValue(table->column(0)->chunk(0), 0);
 }
 
 arrow::Result<std::shared_ptr<arrow::Array>> BuildIntegerArray(const std::shared_ptr<arrow::DataType> &type,
@@ -306,9 +338,13 @@ arrow::Result<std::unique_ptr<arrow::flight::ResultStream>> DoProtoAction(Flight
 	return client.DoAction({}, packed_action);
 }
 
-arrow::Result<std::string> CreatePreparedHandleRaw(FlightSqlClient &client, const std::string &query) {
+arrow::Result<std::string> CreatePreparedHandleRaw(FlightSqlClient &client, const std::string &query,
+                                                   const std::string *transaction_id = nullptr) {
 	flight_sql_pb::ActionCreatePreparedStatementRequest request;
 	request.set_query(query);
+	if (transaction_id && !transaction_id->empty()) {
+		request.set_transaction_id(*transaction_id);
+	}
 
 	ARROW_ASSIGN_OR_RAISE(auto results, DoProtoAction(client, "CreatePreparedStatement", request));
 	ARROW_ASSIGN_OR_RAISE(auto result, results->Next());
@@ -901,6 +937,165 @@ Status RunPrepared(FlightSqlClient &client, const Options &options) {
 	return Status::OK();
 }
 
+Status RunTransaction(FlightSqlClient &client) {
+	const std::string create_table_sql = "CREATE TABLE flight_tx_it (id INTEGER, val VARCHAR)";
+	const std::string drop_table_sql = "DROP TABLE IF EXISTS flight_tx_it";
+	const std::string timeout_reset_sql = "CALL set_flight_sql_transaction_timeout_seconds(1800)";
+	const std::string timeout_enable_sql = "CALL set_flight_sql_transaction_timeout_seconds(1)";
+	const std::string timeout_disable_sql = "CALL set_flight_sql_transaction_timeout_seconds(0)";
+
+	auto cleanup = [&client, &drop_table_sql, &timeout_reset_sql]() {
+		(void)ExecuteUpdate(client, drop_table_sql, std::nullopt);
+		(void)ExecuteQuery(client, timeout_reset_sql);
+	};
+	auto fail_with_cleanup = [&](Status status) {
+		cleanup();
+		return status;
+	};
+
+	ARROW_RETURN_NOT_OK(ExecuteUpdate(client, drop_table_sql, std::nullopt));
+	ARROW_RETURN_NOT_OK(ExecuteUpdate(client, create_table_sql, std::nullopt));
+
+	ARROW_ASSIGN_OR_RAISE(auto rollback_tx, client.BeginTransaction({}));
+	ARROW_RETURN_NOT_OK(ExecuteUpdateInTransaction(client, "INSERT INTO flight_tx_it VALUES (1, 'a'), (2, 'b')", rollback_tx, 2));
+	ARROW_ASSIGN_OR_RAISE(auto rollback_visible, ExecuteQueryInTransaction(
+	                                              client,
+	                                              "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it WHERE id IN (1, 2)",
+	                                              rollback_tx));
+	if (rollback_visible->num_columns() != 1 || rollback_visible->num_rows() != 1 || rollback_visible->column(0)->num_chunks() != 1) {
+		return fail_with_cleanup(Status::Invalid("transaction rollback visibility query returned unexpected shape"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto rollback_visible_count, GetIntValue(rollback_visible->column(0)->chunk(0), 0));
+	if (rollback_visible_count != 2) {
+		return fail_with_cleanup(Status::Invalid("expected rollback transaction to see 2 rows, got ", rollback_visible_count));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto outside_before_rollback, QueryCount(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it"));
+	if (outside_before_rollback != 0) {
+		return fail_with_cleanup(Status::Invalid("uncommitted rows were visible outside rollback transaction"));
+	}
+	auto rollback_status = client.Rollback({}, rollback_tx);
+	if (!rollback_status.ok()) {
+		return fail_with_cleanup(rollback_status);
+	}
+	if (client.Rollback({}, rollback_tx).ok() || client.Commit({}, rollback_tx).ok()) {
+		return fail_with_cleanup(Status::Invalid("transaction handle remained valid after rollback"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto outside_after_rollback, QueryCount(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it"));
+	if (outside_after_rollback != 0) {
+		return fail_with_cleanup(Status::Invalid("rollback did not discard uncommitted rows"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto commit_tx, client.BeginTransaction({}));
+	ARROW_RETURN_NOT_OK(ExecuteUpdateInTransaction(client, "INSERT INTO flight_tx_it VALUES (3, 'c')", commit_tx, 1));
+	auto commit_status = client.Commit({}, commit_tx);
+	if (!commit_status.ok()) {
+		return fail_with_cleanup(commit_status);
+	}
+	if (client.Commit({}, commit_tx).ok() || client.Rollback({}, commit_tx).ok()) {
+		return fail_with_cleanup(Status::Invalid("transaction handle remained valid after commit"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto outside_after_commit,
+	                      QueryCount(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it WHERE id = 3"));
+	if (outside_after_commit != 1) {
+		return fail_with_cleanup(Status::Invalid("committed row was not visible after commit"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto prepared_tx, client.BeginTransaction({}));
+	ARROW_ASSIGN_OR_RAISE(auto prepared_stmt, client.Prepare({}, "INSERT INTO flight_tx_it VALUES (?, ?)", prepared_tx));
+	auto parameter_schema = prepared_stmt->parameter_schema();
+	if (!parameter_schema || parameter_schema->num_fields() != 2) {
+		return fail_with_cleanup(Status::Invalid("unexpected parameter schema for tx-bound prepared statement"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto prep_id_array, BuildIntegerArray(parameter_schema->field(0)->type(), {10}));
+	ARROW_ASSIGN_OR_RAISE(auto prep_val_array, BuildStringArray(parameter_schema->field(1)->type(), {"tx-prepared"}));
+	auto prep_batch = arrow::RecordBatch::Make(parameter_schema, 1, {prep_id_array, prep_val_array});
+	auto set_parameters_status = prepared_stmt->SetParameters(prep_batch);
+	if (!set_parameters_status.ok()) {
+		return fail_with_cleanup(set_parameters_status);
+	}
+	ARROW_ASSIGN_OR_RAISE(auto prepared_rows_changed, prepared_stmt->ExecuteUpdate({}));
+	if (prepared_rows_changed != 1) {
+		return fail_with_cleanup(Status::Invalid("tx-bound prepared statement expected 1 affected row, got ",
+		                                        prepared_rows_changed));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto raw_prepared_handle,
+	                      CreatePreparedHandleRaw(client, "SELECT id FROM flight_tx_it WHERE id = 10",
+	                                              &prepared_tx.transaction_id()));
+	ARROW_ASSIGN_OR_RAISE(auto raw_prepared_before_end, GetPreparedFlightInfoRaw(client, raw_prepared_handle));
+	if (!raw_prepared_before_end || raw_prepared_before_end->endpoints().empty()) {
+		return fail_with_cleanup(Status::Invalid("raw tx-bound prepared statement returned no endpoints"));
+	}
+	auto prepared_close_status = prepared_stmt->Close();
+	if (!prepared_close_status.ok()) {
+		return fail_with_cleanup(prepared_close_status);
+	}
+	auto prepared_rollback_status = client.Rollback({}, prepared_tx);
+	if (!prepared_rollback_status.ok()) {
+		return fail_with_cleanup(prepared_rollback_status);
+	}
+	auto raw_prepared_after_end = GetPreparedFlightInfoRaw(client, raw_prepared_handle);
+	if (raw_prepared_after_end.ok()) {
+		return fail_with_cleanup(Status::Invalid("raw tx-bound prepared statement remained valid after transaction end"));
+	}
+	if (raw_prepared_after_end.status().ToString().find("Prepared statement not found") == std::string::npos) {
+		return fail_with_cleanup(Status::Invalid("unexpected error for tx-bound prepared invalidation: ",
+		                                        raw_prepared_after_end.status().ToString()));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto rolled_back_prepared_row,
+	                      QueryCount(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it WHERE id = 10"));
+	if (rolled_back_prepared_row != 0) {
+		return fail_with_cleanup(Status::Invalid("prepared-in-transaction rollback did not discard inserted row"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto timeout_enable_result, ExecuteQuery(client, timeout_enable_sql));
+	if (!timeout_enable_result || timeout_enable_result->num_rows() != 1) {
+		return fail_with_cleanup(Status::Invalid("failed to set transaction timeout to 1 second"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto timeout_tx, client.BeginTransaction({}));
+	ARROW_RETURN_NOT_OK(ExecuteUpdateInTransaction(client, "INSERT INTO flight_tx_it VALUES (20, 'timeout')", timeout_tx, 1));
+	std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+
+	auto timeout_commit_status = client.Commit({}, timeout_tx);
+	if (timeout_commit_status.ok()) {
+		return fail_with_cleanup(Status::Invalid("timeout transaction unexpectedly committed"));
+	}
+	if (timeout_commit_status.ToString().find("Transaction not found") == std::string::npos) {
+		return fail_with_cleanup(Status::Invalid("transaction timeout did not trigger as expected: ",
+		                                        timeout_commit_status.ToString()));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto timeout_row_count,
+	                      QueryCount(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it WHERE id = 20"));
+	if (timeout_row_count != 0) {
+		return fail_with_cleanup(Status::Invalid("timed-out transaction row was visible after timeout rollback"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto timeout_disable_result, ExecuteQuery(client, timeout_disable_sql));
+	if (!timeout_disable_result || timeout_disable_result->num_rows() != 1) {
+		return fail_with_cleanup(Status::Invalid("failed to disable transaction timeout"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto no_timeout_tx, client.BeginTransaction({}));
+	ARROW_RETURN_NOT_OK(ExecuteUpdateInTransaction(client, "INSERT INTO flight_tx_it VALUES (30, 'no-timeout')", no_timeout_tx, 1));
+	std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+	auto no_timeout_commit_status = client.Commit({}, no_timeout_tx);
+	if (!no_timeout_commit_status.ok()) {
+		return fail_with_cleanup(Status::Invalid("transaction committed failed while timeout was disabled: ",
+		                                        no_timeout_commit_status.ToString()));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto no_timeout_row_count,
+	                      QueryCount(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it WHERE id = 30"));
+	if (no_timeout_row_count != 1) {
+		return fail_with_cleanup(Status::Invalid("transaction did not commit while timeout was disabled"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto timeout_reset_result, ExecuteQuery(client, timeout_reset_sql));
+	if (!timeout_reset_result || timeout_reset_result->num_rows() != 1) {
+		return fail_with_cleanup(Status::Invalid("failed to reset transaction timeout"));
+	}
+	ARROW_RETURN_NOT_OK(ExecuteUpdate(client, drop_table_sql, std::nullopt));
+	return Status::OK();
+}
+
 Status RunMain(const Options &options) {
 	ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp(options.host, options.port));
 	ARROW_ASSIGN_OR_RAISE(auto client, FlightClient::Connect(location));
@@ -913,6 +1108,8 @@ Status RunMain(const Options &options) {
 		status = RunMetadata(sql_client);
 	} else if (options.mode == "prepared") {
 		status = RunPrepared(sql_client, options);
+	} else if (options.mode == "transaction") {
+		status = RunTransaction(sql_client);
 	} else {
 		status = RunCrud(sql_client);
 	}
