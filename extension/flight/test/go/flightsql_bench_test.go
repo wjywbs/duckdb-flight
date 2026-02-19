@@ -27,6 +27,7 @@ var (
 
 const (
 	benchmarkTable   = "go_flight_bench"
+	txBenchmarkTable = "go_flight_tx_bench"
 	crudTable        = "go_flight_crud_tmp"
 	driverName       = "flightsql"
 	driverTimeoutDSN = "120s"
@@ -95,6 +96,19 @@ func resetBenchmarkTable(db *sql.DB) error {
 		return err
 	}
 	_, err := db.Exec("CREATE TABLE " + benchmarkTable + " (id BIGINT PRIMARY KEY, val BIGINT)")
+	return err
+}
+
+func resetTransactionBenchmarkTable(db *sql.DB) error {
+	if _, err := db.Exec("DROP TABLE IF EXISTS " + txBenchmarkTable); err != nil {
+		return err
+	}
+	_, err := db.Exec(
+		"CREATE TABLE " + txBenchmarkTable + " (" +
+			"id BIGINT PRIMARY KEY, " +
+			"worker_id BIGINT, " +
+			"val BIGINT)",
+	)
 	return err
 }
 
@@ -208,13 +222,13 @@ func verifyAggregateTableState(t *testing.T, db *sql.DB, expectedRows int64) {
 	var gotMaxRaw any
 	var gotSumRaw any
 	err := db.QueryRow(
-		"SELECT " +
-			"CAST(COUNT(*) AS BIGINT), " +
-			"CAST(COUNT(DISTINCT id) AS BIGINT), " +
-			"CAST(COALESCE(MIN(id), 0) AS BIGINT), " +
-			"CAST(COALESCE(MAX(id), 0) AS BIGINT), " +
-			"CAST(COALESCE(SUM(val), 0) AS BIGINT) " +
-			"FROM " + benchmarkTable,
+		"SELECT "+
+			"CAST(COUNT(*) AS BIGINT), "+
+			"CAST(COUNT(DISTINCT id) AS BIGINT), "+
+			"CAST(COALESCE(MIN(id), 0) AS BIGINT), "+
+			"CAST(COALESCE(MAX(id), 0) AS BIGINT), "+
+			"CAST(COALESCE(SUM(val), 0) AS BIGINT) "+
+			"FROM "+benchmarkTable,
 	).Scan(&gotCountRaw, &gotDistinctRaw, &gotMinRaw, &gotMaxRaw, &gotSumRaw)
 	if err != nil {
 		t.Fatalf("aggregate verification query failed: %v", err)
@@ -440,6 +454,194 @@ func runConcurrentInsert(t *testing.T, db *sql.DB, rows, workers int) {
 	printOpMetric("concurrent_insert_tx_prepared_ops", duration, int64(rows))
 }
 
+func runConcurrentTransactionCommitRollback(t *testing.T, db *sql.DB, rows, workers int) {
+	t.Helper()
+	requirePositiveFlag(t, rows, "rows")
+	requirePositiveFlag(t, workers, "workers")
+
+	printPhaseStart("CONCURRENT_TRANSACTIONS_COMMIT_ROLLBACK")
+	if err := resetTransactionBenchmarkTable(db); err != nil {
+		t.Fatalf("reset transaction benchmark table failed: %v", err)
+	}
+
+	ranges := partitionRanges(rows, workers)
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	var committedRows atomic.Int64
+	var rolledBackRows atomic.Int64
+	var committedSum atomic.Int64
+	var txnCount int64
+	start := time.Now()
+
+	for workerID, rg := range ranges {
+		if rg.end < rg.start {
+			continue
+		}
+		txnCount++
+		wg.Add(1)
+		go func(worker int, r idRange) {
+			defer wg.Done()
+			ctx := context.Background()
+
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d acquire conn failed: %w", worker, err)
+				return
+			}
+			defer conn.Close()
+
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d begin tx failed: %w", worker, err)
+				return
+			}
+
+			stmt, err := tx.PrepareContext(ctx, "INSERT INTO "+txBenchmarkTable+" VALUES (?, ?, ?)")
+			if err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d prepare insert failed: %w", worker, err)
+				return
+			}
+			defer stmt.Close()
+
+			var localRows int64
+			var localSum int64
+			for id := r.start; id <= r.end; id++ {
+				val := expectedVal(id)
+				if _, err := stmt.ExecContext(ctx, id, worker, val); err != nil {
+					_ = tx.Rollback()
+					errCh <- fmt.Errorf("worker=%d insert failed at id=%d: %w", worker, id, err)
+					return
+				}
+				localRows++
+				localSum += val
+			}
+
+			// During transaction: the worker must see its own uncommitted rows.
+			var inTxCount int64
+			if err := tx.QueryRowContext(
+				ctx,
+				"SELECT CAST(COUNT(*) AS BIGINT) FROM "+txBenchmarkTable+" WHERE worker_id = ?",
+				worker,
+			).Scan(&inTxCount); err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx count query failed: %w", worker, err)
+				return
+			}
+			if inTxCount != localRows {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx count mismatch: got=%d expected=%d", worker, inTxCount, localRows)
+				return
+			}
+
+			// During transaction: outside readers should not see uncommitted rows.
+			var outsideCount int64
+			if err := db.QueryRow(
+				"SELECT CAST(COUNT(*) AS BIGINT) FROM "+txBenchmarkTable+" WHERE worker_id = ?",
+				worker,
+			).Scan(&outsideCount); err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d outside count query failed: %w", worker, err)
+				return
+			}
+			if outsideCount != 0 {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d uncommitted rows visible outside tx: got=%d", worker, outsideCount)
+				return
+			}
+
+			shouldCommit := worker%2 == 0
+			if shouldCommit {
+				if err := tx.Commit(); err != nil {
+					errCh <- fmt.Errorf("worker=%d commit failed: %w", worker, err)
+					return
+				}
+				committedRows.Add(localRows)
+				committedSum.Add(localSum)
+			} else {
+				if err := tx.Rollback(); err != nil {
+					errCh <- fmt.Errorf("worker=%d rollback failed: %w", worker, err)
+					return
+				}
+				rolledBackRows.Add(localRows)
+			}
+
+			// After transaction end: verify persisted rows for this worker are correct.
+			var afterCount int64
+			if err := db.QueryRow(
+				"SELECT CAST(COUNT(*) AS BIGINT) FROM "+txBenchmarkTable+" WHERE worker_id = ?",
+				worker,
+			).Scan(&afterCount); err != nil {
+				errCh <- fmt.Errorf("worker=%d post-tx count query failed: %w", worker, err)
+				return
+			}
+			expectedAfter := int64(0)
+			if shouldCommit {
+				expectedAfter = localRows
+			}
+			if afterCount != expectedAfter {
+				errCh <- fmt.Errorf("worker=%d post-tx count mismatch: got=%d expected=%d", worker, afterCount, expectedAfter)
+				return
+			}
+		}(workerID, rg)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent transaction benchmark failed: %v", err)
+		}
+	}
+
+	expectedCommittedRows := committedRows.Load()
+	expectedRolledBackRows := rolledBackRows.Load()
+	var gotCountRaw any
+	var gotDistinctRaw any
+	var gotSumRaw any
+	if err := db.QueryRow(
+		"SELECT "+
+			"CAST(COUNT(*) AS BIGINT), "+
+			"CAST(COUNT(DISTINCT id) AS BIGINT), "+
+			"CAST(COALESCE(SUM(val), 0) AS BIGINT) "+
+			"FROM "+txBenchmarkTable,
+	).Scan(&gotCountRaw, &gotDistinctRaw, &gotSumRaw); err != nil {
+		t.Fatalf("final transaction aggregate query failed: %v", err)
+	}
+
+	gotCount, err := toInt64(gotCountRaw, "count")
+	if err != nil {
+		t.Fatalf("final transaction aggregate conversion failed for count: %v", err)
+	}
+	gotDistinct, err := toInt64(gotDistinctRaw, "count_distinct")
+	if err != nil {
+		t.Fatalf("final transaction aggregate conversion failed for distinct: %v", err)
+	}
+	gotSum, err := toInt64(gotSumRaw, "sum")
+	if err != nil {
+		t.Fatalf("final transaction aggregate conversion failed for sum: %v", err)
+	}
+
+	if gotCount != expectedCommittedRows {
+		t.Fatalf("final committed row count mismatch: got=%d expected=%d", gotCount, expectedCommittedRows)
+	}
+	if gotDistinct != expectedCommittedRows {
+		t.Fatalf("final committed distinct id mismatch: got=%d expected=%d", gotDistinct, expectedCommittedRows)
+	}
+	if gotSum != committedSum.Load() {
+		t.Fatalf("final committed sum mismatch: got=%d expected=%d", gotSum, committedSum.Load())
+	}
+	if expectedCommittedRows+expectedRolledBackRows != int64(rows) {
+		t.Fatalf("transaction row accounting mismatch: committed=%d rolled_back=%d total_expected=%d",
+			expectedCommittedRows, expectedRolledBackRows, rows)
+	}
+
+	duration := time.Since(start)
+	printOpMetric("concurrent_transactions_total", duration, txnCount)
+	printRowMetric("concurrent_transactions_committed_rows", duration, expectedCommittedRows)
+	printRowMetric("concurrent_transactions_rolledback_rows", duration, expectedRolledBackRows)
+}
+
 func runOrderedSingleRead(t *testing.T, db *sql.DB, rows int) {
 	t.Helper()
 	requirePositiveFlag(t, rows, "rows")
@@ -656,6 +858,7 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	runCrudSingleOpAutocommit(t, db, *flagCrudIters)
 	runBatchInsert(t, db, *flagRows, *flagBatchSize)
 	runConcurrentInsert(t, db, *flagRows, *flagWorkers)
+	runConcurrentTransactionCommitRollback(t, db, *flagRows, *flagWorkers)
 	runOrderedSingleRead(t, db, *flagRows)
 	runOrderedConcurrentRead(t, db, *flagRows, *flagWorkers)
 	runOrderedConcurrentFullRead(t, db, *flagRows, *flagWorkers)
