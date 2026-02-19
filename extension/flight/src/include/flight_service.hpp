@@ -35,6 +35,9 @@ private:
 	std::unique_ptr<std::thread> server_thread;
 	std::string location;
 	std::atomic<bool> started {false};
+	// Stores the desired timeout even when the server is stopped.
+	// Start() applies this to new server instances, and GetTransactionTimeoutSeconds()
+	// falls back to this value when no server is active.
 	std::atomic<int64_t> transaction_timeout_seconds {1800};
 };
 

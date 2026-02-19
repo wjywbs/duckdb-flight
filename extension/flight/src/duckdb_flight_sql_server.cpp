@@ -249,9 +249,8 @@ static std::vector<PreparedParameterDefinition> BuildOrderedParameters(PreparedS
 class LockedFlightDataStream : public FlightDataStream {
 public:
 	LockedFlightDataStream(std::unique_ptr<FlightDataStream> inner_p, std::unique_lock<std::shared_mutex> lock_p,
-	                       std::shared_ptr<void> state_guard_p, std::function<void()> on_close_p = nullptr)
-	    : inner(std::move(inner_p)), lock(std::move(lock_p)), state_guard(std::move(state_guard_p)),
-	      on_close(std::move(on_close_p)) {
+	                       std::shared_ptr<void> state_guard_p)
+	    : inner(std::move(inner_p)), lock(std::move(lock_p)), state_guard(std::move(state_guard_p)) {
 	}
 
 	~LockedFlightDataStream() override {
@@ -285,15 +284,11 @@ private:
 		if (lock.owns_lock()) {
 			lock.unlock();
 		}
-		if (on_close) {
-			on_close();
-		}
 	}
 
 	std::unique_ptr<FlightDataStream> inner;
 	std::unique_lock<std::shared_mutex> lock;
 	std::shared_ptr<void> state_guard;
-	std::function<void()> on_close;
 	bool finalized = false;
 };
 
@@ -304,6 +299,10 @@ struct DuckDBFlightSqlServer::TransactionState {
 	std::unordered_set<uint64_t> owned_prepared_handles;
 	std::shared_mutex mutex;
 	std::atomic<uint64_t> last_activity_ms {0};
+
+	void UpdateActivityTime() {
+		last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
+	}
 };
 
 struct DuckDBFlightSqlServer::PreparedStatementState {
@@ -336,12 +335,30 @@ DuckDBFlightSqlServer::DuckDBFlightSqlServer(shared_ptr<DatabaseInstance> db_ins
 	                SqlInfoResult(int64_t(SqlInfoOptions::SqlNullOrdering::SQL_NULLS_SORTED_AT_END)));
 	RegisterSqlInfo(SqlInfoOptions::SqlInfo::SQL_SEARCH_STRING_ESCAPE, SqlInfoResult(std::string("\\")));
 	UpdateTransactionSqlInfo();
-	StartTransactionSweeper();
 }
 
 DuckDBFlightSqlServer::~DuckDBFlightSqlServer() {
+}
+
+void DuckDBFlightSqlServer::StartFlightSqlState() {
+	bool expected = false;
+	if (!flight_sql_state_started.compare_exchange_strong(expected, true)) {
+		return;
+	}
+	StartTransactionSweeper();
+}
+
+Status DuckDBFlightSqlServer::ShutdownFlightSqlState() {
+	if (!flight_sql_state_started.load(std::memory_order_relaxed)) {
+		return Status::OK();
+	}
+	bool expected = false;
+	if (!flight_sql_state_shutdown.compare_exchange_strong(expected, true)) {
+		return Status::OK();
+	}
 	StopTransactionSweeper();
 	RollbackAllTransactions();
+	return Status::OK();
 }
 
 void DuckDBFlightSqlServer::SetTransactionTimeoutSeconds(int64_t timeout_seconds) {
@@ -363,7 +380,7 @@ Result<ActionBeginTransactionResult> DuckDBFlightSqlServer::BeginTransaction(con
 	} catch (std::exception &ex) {
 		return Status::Invalid(ex.what());
 	}
-	transaction_state->last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
+	transaction_state->UpdateActivityTime();
 
 	auto handle = GenerateTransactionHandle();
 	ARROW_ASSIGN_OR_RAISE(auto transaction_id, DecodeTransactionHandle(handle));
@@ -388,11 +405,8 @@ Status DuckDBFlightSqlServer::EndTransaction(const ServerCallContext & /*context
 		transactions.erase(entry);
 	}
 
-	std::vector<uint64_t> owned_prepared_handles;
 	const auto commit = request.action == ActionEndTransactionRequest::kCommit;
-	auto status = FinalizeTransaction(transaction_state, commit, owned_prepared_handles);
-	RemovePreparedStatements(owned_prepared_handles);
-	return status;
+	return FinalizeTransaction(transaction_state, commit);
 }
 
 Result<ActionBeginSavepointResult> DuckDBFlightSqlServer::BeginSavepoint(const ServerCallContext & /*context*/,
@@ -415,7 +429,6 @@ Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePrepare
 		ARROW_ASSIGN_OR_RAISE(auto transaction_id, DecodeTransactionHandle(request.transaction_id));
 		ARROW_ASSIGN_OR_RAISE(transaction_state, LookupTransaction(transaction_id));
 		transaction_lock = std::unique_lock<std::shared_mutex>(transaction_state->mutex);
-		TouchTransaction(transaction_state);
 		state->transaction_owner = transaction_id;
 		state->prepared = transaction_state->connection->Prepare(request.query);
 	} else {
@@ -460,7 +473,7 @@ Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePrepare
 	}
 	if (transaction_state) {
 		transaction_state->owned_prepared_handles.insert(handle_id);
-		TouchTransaction(transaction_state);
+		transaction_state->UpdateActivityTime();
 	}
 
 	return ActionCreatePreparedStatementResult {std::move(dataset_schema), std::move(parameter_schema), std::move(handle)};
@@ -557,18 +570,6 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::ResultToFlightS
 	return std::make_unique<RecordBatchStream>(std::move(reader_result).ValueOrDie());
 }
 
-Result<std::unique_ptr<FlightDataStream>>
-DuckDBFlightSqlServer::ResultToLockedFlightStream(std::shared_ptr<TransactionState> transaction_state,
-                                                  unique_ptr<QueryResult> result,
-                                                  std::unique_lock<std::shared_mutex> transaction_lock, idx_t batch_size) {
-	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result), batch_size));
-	auto on_close = [transaction_state]() {
-		transaction_state->last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
-	};
-	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
-	                                                std::shared_ptr<void>(transaction_state), std::move(on_close));
-}
-
 Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::StreamSQL(const std::string &sql, idx_t batch_size) {
 	Connection conn(*db);
 	auto result = conn.SendQuery(sql);
@@ -582,7 +583,9 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::StreamSQLInTran
     std::shared_ptr<TransactionState> transaction_state, const std::string &sql, idx_t batch_size) {
 	std::unique_lock<std::shared_mutex> transaction_lock(transaction_state->mutex);
 	ARROW_ASSIGN_OR_RAISE(auto result, QueryInTransaction(transaction_state, sql, true));
-	return ResultToLockedFlightStream(transaction_state, std::move(result), std::move(transaction_lock), batch_size);
+	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result), batch_size));
+	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
+	                                                std::shared_ptr<void>(transaction_state));
 }
 
 Result<unique_ptr<QueryResult>>
@@ -600,7 +603,7 @@ DuckDBFlightSqlServer::QueryInTransaction(const std::shared_ptr<TransactionState
 	if (!result || result->HasError()) {
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
-	TouchTransaction(transaction_state);
+	transaction_state->UpdateActivityTime();
 	return result;
 }
 
@@ -646,17 +649,9 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoPrepared
     const ServerCallContext & /*context*/, const PreparedStatementQuery &command, const FlightDescriptor &descriptor) {
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 	std::shared_ptr<Schema> dataset_schema;
-	std::optional<uint64_t> owner_transaction;
 	{
 		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		dataset_schema = state->dataset_schema;
-		owner_transaction = state->transaction_owner;
-	}
-	if (owner_transaction.has_value()) {
-		auto transaction_lookup = LookupTransaction(owner_transaction.value());
-		if (!transaction_lookup.ok()) {
-			return Status::Invalid("Prepared statement not found");
-		}
 	}
 	return GetFlightInfoForSchema(descriptor, dataset_schema);
 }
@@ -666,17 +661,9 @@ Result<std::unique_ptr<SchemaResult>> DuckDBFlightSqlServer::GetSchemaPreparedSt
     const FlightDescriptor & /*descriptor*/) {
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 	std::shared_ptr<Schema> dataset_schema;
-	std::optional<uint64_t> owner_transaction;
 	{
 		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		dataset_schema = state->dataset_schema;
-		owner_transaction = state->transaction_owner;
-	}
-	if (owner_transaction.has_value()) {
-		auto transaction_lookup = LookupTransaction(owner_transaction.value());
-		if (!transaction_lookup.ok()) {
-			return Status::Invalid("Prepared statement not found");
-		}
 	}
 	return SchemaResult::Make(*dataset_schema);
 }
@@ -717,8 +704,10 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetPreparedSt
 		if (!result || result->HasError()) {
 			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}
-		TouchTransaction(transaction_state);
-		return ResultToLockedFlightStream(transaction_state, std::move(result), std::move(transaction_lock));
+		transaction_state->UpdateActivityTime();
+		ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+		return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
+		                                                std::shared_ptr<void>(transaction_state));
 	}
 
 	std::unique_lock<std::shared_mutex> state_lock(state->mutex);
@@ -749,11 +738,9 @@ Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContex
 	ARROW_ASSIGN_OR_RAISE(auto state, LookupPreparedStatement(command.prepared_statement_handle));
 
 	std::vector<PreparedParameterDefinition> ordered_parameters;
-	std::optional<uint64_t> owner_transaction;
 	{
 		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		ordered_parameters = state->ordered_parameters;
-		owner_transaction = state->transaction_owner;
 	}
 
 	ARROW_ASSIGN_OR_RAISE(auto bound_rows, ReadBoundParameterRows(reader, ordered_parameters));
@@ -770,13 +757,6 @@ Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContex
 		} else {
 			state->query_bound_parameters = std::move(bound_rows[0]);
 		}
-	}
-	if (owner_transaction.has_value()) {
-		auto transaction_lookup = LookupTransaction(owner_transaction.value());
-		if (!transaction_lookup.ok()) {
-			return Status::Invalid("Prepared statement not found");
-		}
-		TouchTransaction(transaction_lookup.ValueOrDie());
 	}
 	(void)writer;
 	return Status::OK();
@@ -795,33 +775,37 @@ Result<int64_t> DuckDBFlightSqlServer::DoPutPreparedStatementUpdate(const Server
 		owner_transaction = state->transaction_owner;
 	}
 
-	int64_t rows_changed = 0;
+	ARROW_ASSIGN_OR_RAISE(auto bound_rows, ReadBoundParameterRows(reader, ordered_parameters));
+
+	std::shared_ptr<TransactionState> transaction_state;
+	std::unique_lock<std::shared_mutex> transaction_lock;
+	std::unique_lock<std::shared_mutex> state_lock;
 	if (owner_transaction.has_value()) {
 		auto transaction_lookup = LookupTransaction(owner_transaction.value());
 		if (!transaction_lookup.ok()) {
 			return Status::Invalid("Prepared statement not found");
 		}
-		auto transaction_state = transaction_lookup.ValueOrDie();
-		std::unique_lock<std::shared_mutex> transaction_lock(transaction_state->mutex);
-		if (!state->prepared) {
-			return Status::Invalid("Prepared statement state is not initialized");
-		}
+		transaction_state = transaction_lookup.ValueOrDie();
+		transaction_lock = std::unique_lock<std::shared_mutex>(transaction_state->mutex);
+	} else {
+		state_lock = std::unique_lock<std::shared_mutex>(state->mutex);
+	}
 
-		if (ordered_parameters.empty()) {
-			case_insensitive_map_t<BoundParameterData> empty_parameters;
-			auto result = state->prepared->Execute(empty_parameters, false);
-			if (!result || result->HasError()) {
-				return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
-			}
-			ARROW_ASSIGN_OR_RAISE(rows_changed, ExtractChangedRows(*result));
-			TouchTransaction(transaction_state);
-			return rows_changed;
-		}
+	if (!state->prepared || (!owner_transaction.has_value() && !state->connection)) {
+		return Status::Invalid("Prepared statement state is not initialized");
+	}
 
-		ARROW_ASSIGN_OR_RAISE(auto bound_rows, ReadBoundParameterRows(reader, ordered_parameters));
-		if (bound_rows.empty()) {
-			return Status::Invalid("Prepared statement update expected at least one bound parameter row");
+	int64_t rows_changed = 0;
+	if (ordered_parameters.empty()) {
+		case_insensitive_map_t<BoundParameterData> empty_parameters;
+		auto result = state->prepared->Execute(empty_parameters, false);
+		if (!result || result->HasError()) {
+			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}
+		ARROW_ASSIGN_OR_RAISE(rows_changed, ExtractChangedRows(*result));
+	} else if (bound_rows.empty()) {
+		return Status::Invalid("Prepared statement update expected at least one bound parameter row");
+	} else {
 		for (auto &named_values : bound_rows) {
 			auto result = state->prepared->Execute(named_values, false);
 			if (!result || result->HasError()) {
@@ -830,36 +814,10 @@ Result<int64_t> DuckDBFlightSqlServer::DoPutPreparedStatementUpdate(const Server
 			ARROW_ASSIGN_OR_RAISE(auto changed_rows, ExtractChangedRows(*result));
 			rows_changed += changed_rows;
 		}
-		TouchTransaction(transaction_state);
-		return rows_changed;
 	}
 
-	std::unique_lock<std::shared_mutex> guard(state->mutex);
-	if (!state->prepared || !state->connection) {
-		return Status::Invalid("Prepared statement state is not initialized");
-	}
-
-	if (ordered_parameters.empty()) {
-		case_insensitive_map_t<BoundParameterData> empty_parameters;
-		auto result = state->prepared->Execute(empty_parameters, false);
-		if (!result || result->HasError()) {
-			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
-		}
-		ARROW_ASSIGN_OR_RAISE(rows_changed, ExtractChangedRows(*result));
-		return rows_changed;
-	}
-
-	ARROW_ASSIGN_OR_RAISE(auto bound_rows, ReadBoundParameterRows(reader, ordered_parameters));
-	if (bound_rows.empty()) {
-		return Status::Invalid("Prepared statement update expected at least one bound parameter row");
-	}
-	for (auto &named_values : bound_rows) {
-		auto result = state->prepared->Execute(named_values, false);
-		if (!result || result->HasError()) {
-			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
-		}
-		ARROW_ASSIGN_OR_RAISE(auto changed_rows, ExtractChangedRows(*result));
-		rows_changed += changed_rows;
+	if (transaction_state) {
+		transaction_state->UpdateActivityTime();
 	}
 	return rows_changed;
 }
@@ -985,15 +943,7 @@ void DuckDBFlightSqlServer::UpdateTransactionSqlInfo() {
 	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_TRANSACTION_TIMEOUT, SqlInfoResult(timeout_millis));
 }
 
-void DuckDBFlightSqlServer::TouchTransaction(const std::shared_ptr<TransactionState> &transaction_state) {
-	if (!transaction_state) {
-		return;
-	}
-	transaction_state->last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
-}
-
-Status DuckDBFlightSqlServer::FinalizeTransaction(const std::shared_ptr<TransactionState> &transaction_state, bool commit,
-                                                  std::vector<uint64_t> &owned_prepared_handles) {
+Status DuckDBFlightSqlServer::FinalizeTransaction(const std::shared_ptr<TransactionState> &transaction_state, bool commit) {
 	std::unique_lock<std::shared_mutex> lock(transaction_state->mutex);
 	if (!transaction_state->connection) {
 		return Status::Invalid("Transaction not found");
@@ -1005,16 +955,13 @@ Status DuckDBFlightSqlServer::FinalizeTransaction(const std::shared_ptr<Transact
 			transaction_state->connection->Rollback();
 		}
 	} catch (std::exception &ex) {
-		owned_prepared_handles.assign(transaction_state->owned_prepared_handles.begin(),
-		                              transaction_state->owned_prepared_handles.end());
+		RemovePreparedStatements(transaction_state->owned_prepared_handles);
 		transaction_state->owned_prepared_handles.clear();
 		return Status::Invalid(ex.what());
 	}
 
-	owned_prepared_handles.assign(transaction_state->owned_prepared_handles.begin(),
-	                              transaction_state->owned_prepared_handles.end());
+	RemovePreparedStatements(transaction_state->owned_prepared_handles);
 	transaction_state->owned_prepared_handles.clear();
-	transaction_state->last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
 	return Status::OK();
 }
 
@@ -1027,7 +974,7 @@ Status DuckDBFlightSqlServer::RemovePreparedStatement(uint64_t handle_id, bool e
 	return Status::OK();
 }
 
-void DuckDBFlightSqlServer::RemovePreparedStatements(const std::vector<uint64_t> &handle_ids) {
+void DuckDBFlightSqlServer::RemovePreparedStatements(const std::unordered_set<uint64_t> &handle_ids) {
 	std::lock_guard<std::mutex> guard(prepared_statements_mutex);
 	for (auto handle_id : handle_ids) {
 		prepared_statements.erase(handle_id);
@@ -1107,17 +1054,15 @@ void DuckDBFlightSqlServer::RunTransactionSweeper() {
 				continue;
 			}
 
-			std::vector<uint64_t> owned_prepared_handles(transaction_state->owned_prepared_handles.begin(),
-			                                             transaction_state->owned_prepared_handles.end());
-			transaction_state->owned_prepared_handles.clear();
 			try {
 				if (transaction_state->connection) {
 					transaction_state->connection->Rollback();
 				}
 			} catch (...) {
 			}
+			RemovePreparedStatements(transaction_state->owned_prepared_handles);
+			transaction_state->owned_prepared_handles.clear();
 			transaction_lock.unlock();
-			RemovePreparedStatements(owned_prepared_handles);
 		}
 	}
 }
@@ -1133,9 +1078,7 @@ void DuckDBFlightSqlServer::RollbackAllTransactions() {
 		transactions.clear();
 	}
 	for (auto &state : states) {
-		std::vector<uint64_t> owned_prepared_handles;
-		(void)FinalizeTransaction(state, false, owned_prepared_handles);
-		RemovePreparedStatements(owned_prepared_handles);
+		(void)FinalizeTransaction(state, false);
 	}
 }
 
