@@ -1,0 +1,20 @@
+diff --git a/arrow/flight/flightsql/driver/driver.go b/arrow/flight/flightsql/driver/driver.go
+--- a/arrow/flight/flightsql/driver/driver.go
++++ b/arrow/flight/flightsql/driver/driver.go
+@@ -505,7 +505,15 @@
+ 		defer cancel()
+ 	}
+ 
+-	info, err := c.client.Execute(execCtx, query)
++	var (
++		info *flight.FlightInfo
++		err  error
++	)
++	if c.txn != nil && c.txn.ID().IsValid() {
++		info, err = c.txn.Execute(execCtx, query)
++	} else {
++		info, err = c.client.Execute(execCtx, query)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
