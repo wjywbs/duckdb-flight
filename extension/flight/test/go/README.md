@@ -48,6 +48,7 @@ The script:
 - 200-goroutine concurrent insert (per-worker transaction + prepared statement)
 - Ordered single-reader scan of 100k rows with correctness checks
 - Ordered concurrent shard scans with correctness checks
+- Ordered concurrent full-table scans with correctness checks (no sharding)
 
 This benchmark path is script-driven and not part of default pytest/CI runs.
 
@@ -67,3 +68,66 @@ Concise conclusion:
 - The slow path was not Flight transport startup overhead; it was write-commit pressure from many tiny autocommit writes.
 - With 200 goroutines, autocommit row-by-row causes high commit and writer-lock contention in a file-backed DB.
 - Grouping each worker's inserts into one transaction and reusing a prepared statement reduced commit frequency and improved concurrent insert throughput by about 10x in this setup.
+
+## Ordered Read Scaling (Why Concurrent Can Be Slower)
+
+To check `select_ordered_concurrent_rows` vs `select_ordered_single_rows`, we ran:
+
+```sh
+extension/flight/test/go/run_flight_go_bench.sh --rows 100000 --batch-size 1000 --crud-iters 200 --workers <N>
+```
+
+Results (rows/sec):
+
+| Workers | Single Ordered Read | Concurrent Ordered Read | Concurrent / Single |
+| --- | ---: | ---: | ---: |
+| 1 | 6.78M | 8.11M | 1.20x |
+| 2 | 6.32M | 10.10M | 1.60x |
+| 4 | 6.05M | 14.09M | 2.33x |
+| 8 | 6.32M | 12.56M | 1.99x |
+| 16 | 5.74M | 10.97M | 1.91x |
+| 32 | 5.81M | 7.11M | 1.22x |
+| 64 | 5.39M | 7.02M | 1.30x |
+| 128 | 5.54M | 4.10M | 0.74x |
+| 200 | 5.48M | 2.57M | 0.47x |
+
+Interpretation:
+
+- Throughput does **not** keep increasing with more workers.
+- It improves up to low worker counts (best here at `N=4`), then declines.
+- At high worker counts (`128`, `200`), concurrent read is slower than a single ordered scan.
+- Reason: concurrent mode issues many small shard queries (`WHERE id BETWEEN ? AND ? ORDER BY id`), so query/Flight stream setup and scheduling overhead dominates when each worker reads only a small slice.
+
+## Ordered Read Scaling (No Sharding, Full Scan per Worker)
+
+New test behavior:
+
+- each worker runs `SELECT id, val FROM go_flight_bench ORDER BY id`
+- each worker validates all `100000` rows
+- total processed rows for throughput = `rows * workers`
+
+Same sweep command:
+
+```sh
+extension/flight/test/go/run_flight_go_bench.sh --rows 100000 --batch-size 1000 --crud-iters 200 --workers <N>
+```
+
+Results:
+
+| Workers | Single Ordered Read (rows/s) | Sharded Concurrent (rows/s) | Full Concurrent (rows/s, aggregate) |
+| --- | ---: | ---: | ---: |
+| 1 | 6.04M | 8.04M | 7.88M |
+| 2 | 6.36M | 9.97M | 13.89M |
+| 4 | 5.36M | 13.92M | 22.06M |
+| 8 | 5.81M | 9.72M | 31.78M |
+| 16 | 5.61M | 12.39M | 35.54M |
+| 32 | 5.64M | 9.45M | 39.60M |
+| 64 | 5.56M | 6.76M | 41.58M |
+| 128 | 5.55M | 3.56M | 42.39M |
+| 200 | 5.70M | 2.58M | 41.32M |
+
+Interpretation:
+
+- For the full-scan test, aggregate throughput increases with workers up to roughly `64-128`, then plateaus around `41-42M rows/s`.
+- Unlike sharded mode, full-scan mode does not collapse at high workers in aggregate throughput, but it also does not scale linearly with worker count.
+- This indicates shared bottlenecks (CPU scheduling, gRPC/Flight stream overhead, and memory bandwidth) limit scaling once concurrency is high.
