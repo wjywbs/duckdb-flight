@@ -666,6 +666,224 @@ func isExpectedConflictError(err error) bool {
 		strings.Contains(msg, "constraint")
 }
 
+func isExpectedMissingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "catalog")
+}
+
+func runConcurrentTransactionCreateDropInsertSelect(t *testing.T, db *sql.DB, rows, workers int) {
+	t.Helper()
+	requirePositiveFlag(t, rows, "rows")
+	requirePositiveFlag(t, workers, "workers")
+
+	printPhaseStart("CONCURRENT_TRANSACTIONS_DDL_DML")
+	ranges := partitionRanges(rows, workers)
+	runID := time.Now().UnixNano()
+	tablePrefix := fmt.Sprintf("go_flight_tx_ddl_%d_", runID)
+
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	var txnCount int64
+	var insertedRows atomic.Int64
+	var selectedRows atomic.Int64
+	start := time.Now()
+
+	for workerID, rg := range ranges {
+		if rg.end < rg.start {
+			continue
+		}
+		txnCount++
+		wg.Add(1)
+		go func(worker int, r idRange) {
+			defer wg.Done()
+			ctx := context.Background()
+			tableName := fmt.Sprintf("%s%d", tablePrefix, worker)
+
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d acquire conn failed: %w", worker, err)
+				return
+			}
+			defer conn.Close()
+
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d begin tx failed: %w", worker, err)
+				return
+			}
+
+			if _, err := tx.ExecContext(
+				ctx,
+				"CREATE TABLE "+tableName+" (id BIGINT PRIMARY KEY, val BIGINT)",
+			); err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d create table failed: %w", worker, err)
+				return
+			}
+
+			// Outside connection should not observe uncommitted DDL.
+			var outsideDdlRaw any
+			outsideErr := db.QueryRow(
+				"SELECT CAST(COUNT(*) AS BIGINT) FROM " + tableName,
+			).Scan(&outsideDdlRaw)
+			if outsideErr == nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d outside query unexpectedly saw uncommitted table", worker)
+				return
+			}
+			if !isExpectedMissingTableError(outsideErr) {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d outside query returned unexpected error for uncommitted table: %w", worker, outsideErr)
+				return
+			}
+
+			stmt, err := tx.PrepareContext(ctx, "INSERT INTO "+tableName+" VALUES (?, ?)")
+			if err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d prepare insert failed: %w", worker, err)
+				return
+			}
+			defer stmt.Close()
+
+			var localRows int64
+			var localSum int64
+			for id := r.start; id <= r.end; id++ {
+				val := expectedVal(id)
+				if _, err := stmt.ExecContext(ctx, id, val); err != nil {
+					_ = tx.Rollback()
+					errCh <- fmt.Errorf("worker=%d insert failed at id=%d: %w", worker, id, err)
+					return
+				}
+				localRows++
+				localSum += val
+			}
+
+			// Arrow Go Flight SQL driver v18.5.1 routes zero-arg Tx.QueryContext through
+			// Connection.QueryContext, which currently ignores c.txn. Force parameter binding
+			// so database/sql uses prepared statement path bound to the active transaction.
+			var inTxCountRaw any
+			var inTxSumRaw any
+			if err := tx.QueryRowContext(
+				ctx,
+				"SELECT CAST(COUNT(*) AS BIGINT), CAST(COALESCE(SUM(val), 0) AS BIGINT) FROM "+tableName+
+					" WHERE id >= ?",
+				r.start,
+			).Scan(&inTxCountRaw, &inTxSumRaw); err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx select aggregate failed: %w", worker, err)
+				return
+			}
+			inTxCount, err := toInt64(inTxCountRaw, "in_tx_count")
+			if err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx count conversion failed: %w", worker, err)
+				return
+			}
+			inTxSum, err := toInt64(inTxSumRaw, "in_tx_sum")
+			if err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx sum conversion failed: %w", worker, err)
+				return
+			}
+			if inTxCount != localRows {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx row count mismatch: got=%d expected=%d", worker, inTxCount, localRows)
+				return
+			}
+			if inTxSum != localSum {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d in-tx sum mismatch: got=%d expected=%d", worker, inTxSum, localSum)
+				return
+			}
+
+			if _, err := tx.ExecContext(ctx, "DROP TABLE "+tableName); err != nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d drop table failed: %w", worker, err)
+				return
+			}
+
+			// After DROP in tx, table should be inaccessible in the same tx.
+			var droppedCheckRaw any
+			droppedCheckErr := tx.QueryRowContext(
+				ctx,
+				"SELECT CAST(COUNT(*) AS BIGINT) FROM "+tableName,
+			).Scan(&droppedCheckRaw)
+			if droppedCheckErr == nil {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d dropped table still queryable inside tx", worker)
+				return
+			}
+			if !isExpectedMissingTableError(droppedCheckErr) {
+				_ = tx.Rollback()
+				errCh <- fmt.Errorf("worker=%d unexpected error after drop inside tx: %w", worker, droppedCheckErr)
+				return
+			}
+
+			if err := tx.Commit(); err != nil {
+				errCh <- fmt.Errorf("worker=%d commit failed: %w", worker, err)
+				return
+			}
+
+			// After commit, table must not exist.
+			var postCommitRaw any
+			postCommitErr := db.QueryRow(
+				"SELECT CAST(COUNT(*) AS BIGINT) FROM " + tableName,
+			).Scan(&postCommitRaw)
+			if postCommitErr == nil {
+				errCh <- fmt.Errorf("worker=%d table exists after commit despite drop", worker)
+				return
+			}
+			if !isExpectedMissingTableError(postCommitErr) {
+				errCh <- fmt.Errorf("worker=%d unexpected post-commit missing-table error: %w", worker, postCommitErr)
+				return
+			}
+
+			insertedRows.Add(localRows)
+			selectedRows.Add(localRows)
+		}(workerID, rg)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent transaction DDL/DML benchmark failed: %v", err)
+		}
+	}
+
+	var leftoverTablesRaw any
+	if err := db.QueryRow(
+		"SELECT CAST(COUNT(*) AS BIGINT) FROM duckdb_tables() WHERE table_name LIKE ?",
+		tablePrefix+"%",
+	).Scan(&leftoverTablesRaw); err != nil {
+		t.Fatalf("leftover table verification query failed: %v", err)
+	}
+	leftoverTables, err := toInt64(leftoverTablesRaw, "leftover_tables")
+	if err != nil {
+		t.Fatalf("leftover table conversion failed: %v", err)
+	}
+	if leftoverTables != 0 {
+		t.Fatalf("leftover table count mismatch: got=%d expected=0", leftoverTables)
+	}
+
+	if insertedRows.Load() != int64(rows) {
+		t.Fatalf("inserted row accounting mismatch: got=%d expected=%d", insertedRows.Load(), rows)
+	}
+	if selectedRows.Load() != int64(rows) {
+		t.Fatalf("selected row accounting mismatch: got=%d expected=%d", selectedRows.Load(), rows)
+	}
+
+	duration := time.Since(start)
+	printOpMetric("concurrent_tx_ddl_dml_total", duration, txnCount)
+	printRowMetric("concurrent_tx_ddl_dml_inserted_rows", duration, insertedRows.Load())
+	printRowMetric("concurrent_tx_ddl_dml_selected_rows", duration, selectedRows.Load())
+}
+
 func runConcurrentTransactionCommitConflicts(t *testing.T, db *sql.DB, workers int) {
 	t.Helper()
 	requirePositiveFlag(t, workers, "workers")
@@ -1083,6 +1301,7 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	runBatchInsert(t, db, *flagRows, *flagBatchSize)
 	runConcurrentInsert(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCommitRollback(t, db, *flagRows, *flagWorkers)
+	runConcurrentTransactionCreateDropInsertSelect(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCommitConflicts(t, db, *flagWorkers)
 	runOrderedSingleRead(t, db, *flagRows)
 	runOrderedConcurrentRead(t, db, *flagRows, *flagWorkers)
