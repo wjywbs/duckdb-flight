@@ -349,11 +349,8 @@ void DuckDBFlightSqlServer::StartFlightSqlState() {
 }
 
 Status DuckDBFlightSqlServer::ShutdownFlightSqlState() {
-	if (!flight_sql_state_started.load(std::memory_order_relaxed)) {
-		return Status::OK();
-	}
-	bool expected = false;
-	if (!flight_sql_state_shutdown.compare_exchange_strong(expected, true)) {
+	bool expected = true;
+	if (!flight_sql_state_started.compare_exchange_strong(expected, false)) {
 		return Status::OK();
 	}
 	StopTransactionSweeper();
