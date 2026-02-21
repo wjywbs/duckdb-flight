@@ -633,6 +633,8 @@ Status RunMetadata(FlightSqlClient &client) {
 }
 
 Status RunPrepared(FlightSqlClient &client, const Options &options) {
+	const std::string timeout_reset_sql = "CALL set_flight_sql_transaction_timeout_seconds(1800)";
+	const std::string timeout_enable_sql = "CALL set_flight_sql_transaction_timeout_seconds(1)";
 	std::vector<std::shared_ptr<PreparedStatement>> statements;
 	std::vector<std::string> raw_handles;
 	auto cleanup = [&]() {
@@ -643,6 +645,7 @@ Status RunPrepared(FlightSqlClient &client, const Options &options) {
 			(void)ClosePreparedHandleRaw(client, handle);
 		}
 		(void)ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_prep_it", std::nullopt);
+		(void)ExecuteQuery(client, timeout_reset_sql);
 	};
 	auto fail_with_cleanup = [&](Status status) {
 		cleanup();
@@ -929,6 +932,27 @@ Status RunPrepared(FlightSqlClient &client, const Options &options) {
 		                    ", ", second_concurrent_rows));
 	}
 
+	ARROW_ASSIGN_OR_RAISE(auto timeout_enable_result, ExecuteQuery(client, timeout_enable_sql));
+	if (!timeout_enable_result || timeout_enable_result->num_rows() != 1) {
+		return fail_with_cleanup(Status::Invalid("failed to set transaction timeout to 1 second"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto timeout_handle, CreatePreparedHandleRaw(client, "SELECT 123 AS v"));
+	raw_handles.push_back(timeout_handle);
+	ARROW_ASSIGN_OR_RAISE(auto timeout_before_expiry, GetPreparedFlightInfoRaw(client, timeout_handle));
+	if (!timeout_before_expiry || timeout_before_expiry->endpoints().empty()) {
+		return fail_with_cleanup(Status::Invalid("timed prepared handle returned no endpoints before expiry"));
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+	auto timeout_after_expiry = GetPreparedFlightInfoRaw(client, timeout_handle);
+	if (timeout_after_expiry.ok()) {
+		return fail_with_cleanup(Status::Invalid("timed-out prepared handle unexpectedly remained valid"));
+	}
+	if (timeout_after_expiry.status().ToString().find("Prepared statement not found") == std::string::npos) {
+		return fail_with_cleanup(Status::Invalid("unexpected timed-out prepared-handle error: ",
+		                                        timeout_after_expiry.status().ToString()));
+	}
+	raw_handles.pop_back();
+
 	status = ExecuteUpdate(client, "DROP TABLE flight_prep_it", std::nullopt);
 	if (!status.ok()) {
 		return contextual_fail("drop flight_prep_it", status);
@@ -1050,6 +1074,36 @@ Status RunTransaction(FlightSqlClient &client) {
 	ARROW_ASSIGN_OR_RAISE(auto timeout_enable_result, ExecuteQuery(client, timeout_enable_sql));
 	if (!timeout_enable_result || timeout_enable_result->num_rows() != 1) {
 		return fail_with_cleanup(Status::Invalid("failed to set transaction timeout to 1 second"));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto linked_tx, client.BeginTransaction({}));
+	ARROW_ASSIGN_OR_RAISE(auto linked_prepared_handle,
+	                      CreatePreparedHandleRaw(client, "SELECT id FROM flight_tx_it WHERE id = 3",
+	                                              &linked_tx.transaction_id()));
+	for (int i = 0; i < 6; i++) {
+		ARROW_ASSIGN_OR_RAISE(auto keepalive_result,
+		                      ExecuteQueryInTransaction(client, "SELECT COUNT(*)::BIGINT AS cnt FROM flight_tx_it", linked_tx));
+		if (!keepalive_result || keepalive_result->num_rows() != 1) {
+			return fail_with_cleanup(Status::Invalid("linked transaction keepalive query failed"));
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(600));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto linked_prepared_info_before_end, GetPreparedFlightInfoRaw(client, linked_prepared_handle));
+	if (!linked_prepared_info_before_end || linked_prepared_info_before_end->endpoints().empty()) {
+		return fail_with_cleanup(Status::Invalid("linked transaction prepared handle unexpectedly invalidated"));
+	}
+	auto linked_rollback_status = client.Rollback({}, linked_tx);
+	if (!linked_rollback_status.ok()) {
+		return fail_with_cleanup(Status::Invalid("linked transaction rollback failed: ",
+		                                        linked_rollback_status.ToString()));
+	}
+	auto linked_prepared_info_after_end = GetPreparedFlightInfoRaw(client, linked_prepared_handle);
+	if (linked_prepared_info_after_end.ok()) {
+		return fail_with_cleanup(Status::Invalid("linked transaction prepared handle remained valid after transaction end"));
+	}
+	if (linked_prepared_info_after_end.status().ToString().find("Prepared statement not found") == std::string::npos) {
+		return fail_with_cleanup(Status::Invalid("unexpected linked transaction prepared-handle error: ",
+		                                        linked_prepared_info_after_end.status().ToString()));
 	}
 
 	ARROW_ASSIGN_OR_RAISE(auto timeout_tx, client.BeginTransaction({}));

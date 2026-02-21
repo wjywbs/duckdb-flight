@@ -313,6 +313,11 @@ struct DuckDBFlightSqlServer::PreparedStatementState {
 	unique_ptr<PreparedStatement> prepared;
 	std::optional<uint64_t> transaction_owner;
 	std::shared_mutex mutex;
+	std::atomic<uint64_t> last_activity_ms {0};
+
+	void UpdateActivityTime() {
+		last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
+	}
 };
 
 DuckDBFlightSqlServer::DuckDBFlightSqlServer(shared_ptr<DatabaseInstance> db_instance) : db(std::move(db_instance)) {
@@ -468,6 +473,7 @@ Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePrepare
 		std::lock_guard<std::mutex> guard(prepared_statements_mutex);
 		prepared_statements[handle_id] = state;
 	}
+	state->UpdateActivityTime();
 	if (transaction_state) {
 		transaction_state->owned_prepared_handles.insert(handle_id);
 		transaction_state->UpdateActivityTime();
@@ -650,6 +656,7 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoPrepared
 		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		dataset_schema = state->dataset_schema;
 	}
+	state->UpdateActivityTime();
 	return GetFlightInfoForSchema(descriptor, dataset_schema);
 }
 
@@ -662,6 +669,7 @@ Result<std::unique_ptr<SchemaResult>> DuckDBFlightSqlServer::GetSchemaPreparedSt
 		std::shared_lock<std::shared_mutex> guard(state->mutex);
 		dataset_schema = state->dataset_schema;
 	}
+	state->UpdateActivityTime();
 	return SchemaResult::Make(*dataset_schema);
 }
 
@@ -701,6 +709,7 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetPreparedSt
 		if (!result || result->HasError()) {
 			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}
+		state->UpdateActivityTime();
 		transaction_state->UpdateActivityTime();
 		ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
 		return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
@@ -724,6 +733,7 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetPreparedSt
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
 
+	state->UpdateActivityTime();
 	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
 	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(state_lock), std::shared_ptr<void>(state));
 }
@@ -755,6 +765,7 @@ Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContex
 			state->query_bound_parameters = std::move(bound_rows[0]);
 		}
 	}
+	state->UpdateActivityTime();
 	(void)writer;
 	return Status::OK();
 }
@@ -813,6 +824,7 @@ Result<int64_t> DuckDBFlightSqlServer::DoPutPreparedStatementUpdate(const Server
 		}
 	}
 
+	state->UpdateActivityTime();
 	if (transaction_state) {
 		transaction_state->UpdateActivityTime();
 	}
@@ -937,6 +949,7 @@ void DuckDBFlightSqlServer::UpdateTransactionSqlInfo() {
 		const auto max_seconds = std::numeric_limits<int64_t>::max() / 1000;
 		timeout_millis = timeout_seconds > max_seconds ? std::numeric_limits<int64_t>::max() : timeout_seconds * 1000;
 	}
+	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_STATEMENT_TIMEOUT, SqlInfoResult(timeout_millis));
 	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_TRANSACTION_TIMEOUT, SqlInfoResult(timeout_millis));
 }
 
@@ -1060,6 +1073,51 @@ void DuckDBFlightSqlServer::RunTransactionSweeper() {
 			RemovePreparedStatements(transaction_state->owned_prepared_handles);
 			transaction_state->owned_prepared_handles.clear();
 			transaction_lock.unlock();
+		}
+
+		std::vector<std::pair<uint64_t, std::shared_ptr<PreparedStatementState>>> prepared_snapshot;
+		{
+			std::lock_guard<std::mutex> guard(prepared_statements_mutex);
+			prepared_snapshot.reserve(prepared_statements.size());
+			for (auto &entry : prepared_statements) {
+				prepared_snapshot.push_back(entry);
+			}
+		}
+
+		const auto prepared_now_ms = CurrentTimeMillis();
+		for (auto &entry : prepared_snapshot) {
+			auto prepared_id = entry.first;
+			auto &prepared_state = entry.second;
+			auto last_activity_ms = prepared_state->last_activity_ms.load(std::memory_order_relaxed);
+			if (prepared_now_ms <= last_activity_ms || prepared_now_ms - last_activity_ms < timeout_ms) {
+				continue;
+			}
+
+			std::unique_lock<std::shared_mutex> prepared_lock(prepared_state->mutex, std::try_to_lock);
+			if (!prepared_lock.owns_lock()) {
+				continue;
+			}
+
+			last_activity_ms = prepared_state->last_activity_ms.load(std::memory_order_relaxed);
+			const auto prepared_recheck_now_ms = CurrentTimeMillis();
+			if (prepared_recheck_now_ms <= last_activity_ms || prepared_recheck_now_ms - last_activity_ms < timeout_ms) {
+				continue;
+			}
+
+			bool has_linked_transaction = false;
+			if (prepared_state->transaction_owner.has_value()) {
+				std::lock_guard<std::mutex> guard(transactions_mutex);
+				has_linked_transaction = transactions.find(prepared_state->transaction_owner.value()) != transactions.end();
+			}
+			if (has_linked_transaction) {
+				continue;
+			}
+
+			std::lock_guard<std::mutex> guard(prepared_statements_mutex);
+			auto current_entry = prepared_statements.find(prepared_id);
+			if (current_entry != prepared_statements.end() && current_entry->second == prepared_state) {
+				prepared_statements.erase(current_entry);
+			}
 		}
 	}
 }
