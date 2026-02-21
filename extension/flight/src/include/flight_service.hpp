@@ -20,6 +20,8 @@ public:
 	std::string Stop();
 	std::string SetTransactionTimeoutSeconds(int64_t timeout_seconds);
 	int64_t GetTransactionTimeoutSeconds() const;
+	std::string SetPreparedTimeoutSeconds(int64_t timeout_seconds);
+	int64_t GetPreparedTimeoutSeconds() const;
 	bool IsStarted() const;
 	std::string Location() const;
 
@@ -39,6 +41,10 @@ private:
 	// Start() applies this to new server instances, and GetTransactionTimeoutSeconds()
 	// falls back to this value when no server is active.
 	std::atomic<int64_t> transaction_timeout_seconds {1800};
+	// Stores the desired prepared-statement timeout even when the server is stopped.
+	// Start() applies this to new server instances, and GetPreparedTimeoutSeconds()
+	// falls back to this value when no server is active.
+	std::atomic<int64_t> prepared_timeout_seconds {1800};
 };
 
 } // namespace flight
