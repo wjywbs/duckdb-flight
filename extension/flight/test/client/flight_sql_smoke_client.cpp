@@ -804,8 +804,8 @@ Status RunMetadata(FlightSqlClient &client) {
 }
 
 Status RunPrepared(FlightSqlClient &client, const Options &options) {
-	const std::string timeout_reset_sql = "CALL set_flight_sql_transaction_timeout_seconds(1800)";
-	const std::string timeout_enable_sql = "CALL set_flight_sql_transaction_timeout_seconds(1)";
+	const std::string timeout_reset_sql = "CALL set_flight_sql_prepared_timeout_seconds(1800)";
+	const std::string timeout_enable_sql = "CALL set_flight_sql_prepared_timeout_seconds(1)";
 	std::vector<std::shared_ptr<PreparedStatement>> statements;
 	std::vector<std::string> raw_handles;
 	auto cleanup = [&]() {
@@ -1105,7 +1105,7 @@ Status RunPrepared(FlightSqlClient &client, const Options &options) {
 
 	ARROW_ASSIGN_OR_RAISE(auto timeout_enable_result, ExecuteQuery(client, timeout_enable_sql));
 	if (!timeout_enable_result || timeout_enable_result->num_rows() != 1) {
-		return fail_with_cleanup(Status::Invalid("failed to set transaction timeout to 1 second"));
+		return fail_with_cleanup(Status::Invalid("failed to set prepared timeout to 1 second"));
 	}
 	ARROW_ASSIGN_OR_RAISE(auto timeout_handle, CreatePreparedHandleRaw(client, "SELECT 123 AS v"));
 	raw_handles.push_back(timeout_handle);

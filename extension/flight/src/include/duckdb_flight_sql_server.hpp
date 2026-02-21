@@ -30,6 +30,8 @@ public:
 
 	void SetTransactionTimeoutSeconds(int64_t timeout_seconds);
 	int64_t GetTransactionTimeoutSeconds() const;
+	void SetPreparedTimeoutSeconds(int64_t timeout_seconds);
+	int64_t GetPreparedTimeoutSeconds() const;
 
 	arrow::Result<arrow::flight::sql::ActionBeginTransactionResult> BeginTransaction(
 	    const arrow::flight::ServerCallContext &context,
@@ -108,6 +110,7 @@ private:
 	std::unordered_map<uint64_t, std::shared_ptr<TransactionState>> transactions;
 	std::atomic<uint64_t> transaction_counter {0};
 	std::atomic<int64_t> transaction_timeout_seconds {1800};
+	std::atomic<int64_t> prepared_timeout_seconds {1800};
 	std::atomic<bool> sweeper_stopping {false};
 	std::atomic<bool> flight_sql_state_started {false};
 	std::condition_variable sweeper_cv;
