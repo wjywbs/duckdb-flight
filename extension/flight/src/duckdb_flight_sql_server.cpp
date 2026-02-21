@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -18,6 +19,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/flight/sql/server.h"
+#include "arrow/ipc/writer.h"
 
 namespace duckdb {
 namespace flight {
@@ -69,10 +71,56 @@ struct DecodedStatementHandle {
 	std::optional<uint64_t> transaction_id;
 };
 
+struct TableMetadataRow {
+	std::optional<std::string> catalog_name;
+	std::optional<std::string> db_schema_name;
+	std::string table_name;
+	std::string table_type;
+};
+
 static uint64_t CurrentTimeMillis() {
 	return NumericCast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
 	                                 .count());
+}
+
+static std::string QuoteIdentifier(const std::string &identifier) {
+	return "\"" + StringUtil::Replace(identifier, "\"", "\"\"") + "\"";
+}
+
+static std::string BuildGetTablesSQL(const GetTables &command) {
+	std::string sql =
+	    "WITH all_tables AS ("
+	    "  SELECT database_name AS catalog_name, schema_name AS db_schema_name, table_name, 'TABLE' AS table_type"
+	    "  FROM duckdb_tables()"
+	    "  UNION ALL "
+	    "  SELECT database_name AS catalog_name, schema_name AS db_schema_name, view_name AS table_name, 'VIEW' AS table_type"
+	    "  FROM duckdb_views()"
+	    ") SELECT catalog_name, db_schema_name, table_name, table_type FROM all_tables WHERE 1=1";
+
+	if (command.catalog.has_value()) {
+		sql += StringUtil::Format(" AND catalog_name = '%s'", StringUtil::Replace(command.catalog.value(), "'", "''"));
+	}
+	if (command.db_schema_filter_pattern.has_value()) {
+		sql += StringUtil::Format(" AND db_schema_name LIKE '%s'",
+		                         StringUtil::Replace(command.db_schema_filter_pattern.value(), "'", "''"));
+	}
+	if (command.table_name_filter_pattern.has_value()) {
+		sql += StringUtil::Format(" AND table_name LIKE '%s'",
+		                         StringUtil::Replace(command.table_name_filter_pattern.value(), "'", "''"));
+	}
+	if (!command.table_types.empty()) {
+		sql += " AND table_type IN (";
+		for (idx_t i = 0; i < command.table_types.size(); i++) {
+			if (i > 0) {
+				sql += ", ";
+			}
+			sql += StringUtil::Format("'%s'", StringUtil::Replace(command.table_types[i], "'", "''"));
+		}
+		sql += ")";
+	}
+	sql += " ORDER BY catalog_name, db_schema_name, table_name";
+	return sql;
 }
 
 static std::string EncodeHandleLE(const uint64_t handle_id) {
@@ -885,49 +933,104 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoTables(c
                                                                                const GetTables &command,
                                                                                const FlightDescriptor &descriptor) {
 	if (command.include_schema) {
-		return Status::NotImplemented("GetTables(include_schema=true) is not implemented in this version");
+		return GetFlightInfoForSchema(descriptor, SqlSchema::GetTablesSchemaWithIncludedSchema());
 	}
 	return GetFlightInfoForSchema(descriptor, SqlSchema::GetTablesSchema());
 }
 
 Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetTables(const ServerCallContext & /*context*/,
                                                                              const GetTables &command) {
-	if (command.include_schema) {
-		return Status::NotImplemented("DoGetTables(include_schema=true) is not implemented in this version");
+	auto sql = BuildGetTablesSQL(command);
+	if (!command.include_schema) {
+		return StreamSQL(sql);
 	}
 
-	std::string sql =
-	    "WITH all_tables AS ("
-	    "  SELECT database_name AS catalog_name, schema_name AS db_schema_name, table_name, 'TABLE' AS table_type"
-	    "  FROM duckdb_tables()"
-	    "  UNION ALL "
-	    "  SELECT database_name AS catalog_name, schema_name AS db_schema_name, view_name AS table_name, 'VIEW' AS table_type"
-	    "  FROM duckdb_views()"
-	    ") SELECT catalog_name, db_schema_name, table_name, table_type FROM all_tables WHERE 1=1";
+	Connection conn(*db);
+	auto metadata_result = conn.Query(sql);
+	if (!metadata_result || metadata_result->HasError()) {
+		return Status::Invalid(metadata_result ? metadata_result->GetError() : "Unknown DuckDB query failure");
+	}
 
-	if (command.catalog.has_value()) {
-		sql += StringUtil::Format(" AND catalog_name = '%s'", StringUtil::Replace(command.catalog.value(), "'", "''"));
-	}
-	if (command.db_schema_filter_pattern.has_value()) {
-		sql += StringUtil::Format(" AND db_schema_name LIKE '%s'",
-		                         StringUtil::Replace(command.db_schema_filter_pattern.value(), "'", "''"));
-	}
-	if (command.table_name_filter_pattern.has_value()) {
-		sql += StringUtil::Format(" AND table_name LIKE '%s'",
-		                         StringUtil::Replace(command.table_name_filter_pattern.value(), "'", "''"));
-	}
-	if (!command.table_types.empty()) {
-		sql += " AND table_type IN (";
-		for (idx_t i = 0; i < command.table_types.size(); i++) {
-			if (i > 0) {
-				sql += ", ";
-			}
-			sql += StringUtil::Format("'%s'", StringUtil::Replace(command.table_types[i], "'", "''"));
+	std::vector<TableMetadataRow> rows;
+	while (true) {
+		auto chunk = metadata_result->Fetch();
+		if (!chunk) {
+			break;
 		}
-		sql += ")";
+		for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+			TableMetadataRow row;
+			auto catalog_value = chunk->GetValue(0, row_idx);
+			if (!catalog_value.IsNull()) {
+				row.catalog_name = catalog_value.GetValue<std::string>();
+			}
+			auto schema_value = chunk->GetValue(1, row_idx);
+			if (!schema_value.IsNull()) {
+				row.db_schema_name = schema_value.GetValue<std::string>();
+			}
+
+			auto table_name_value = chunk->GetValue(2, row_idx);
+			auto table_type_value = chunk->GetValue(3, row_idx);
+			if (table_name_value.IsNull() || table_type_value.IsNull()) {
+				return Status::Invalid("GetTables returned NULL table_name or table_type");
+			}
+			row.table_name = table_name_value.GetValue<std::string>();
+			row.table_type = table_type_value.GetValue<std::string>();
+			rows.push_back(std::move(row));
+		}
 	}
-	sql += " ORDER BY catalog_name, db_schema_name, table_name";
-	return StreamSQL(sql);
+
+	arrow::StringBuilder catalog_builder;
+	arrow::StringBuilder schema_builder;
+	arrow::StringBuilder table_name_builder;
+	arrow::StringBuilder table_type_builder;
+	arrow::BinaryBuilder table_schema_builder;
+
+	for (auto &row : rows) {
+		if (row.catalog_name.has_value()) {
+			ARROW_RETURN_NOT_OK(catalog_builder.Append(row.catalog_name.value()));
+		} else {
+			ARROW_RETURN_NOT_OK(catalog_builder.AppendNull());
+		}
+		if (row.db_schema_name.has_value()) {
+			ARROW_RETURN_NOT_OK(schema_builder.Append(row.db_schema_name.value()));
+		} else {
+			ARROW_RETURN_NOT_OK(schema_builder.AppendNull());
+		}
+		ARROW_RETURN_NOT_OK(table_name_builder.Append(row.table_name));
+		ARROW_RETURN_NOT_OK(table_type_builder.Append(row.table_type));
+
+		if (!row.catalog_name.has_value() || !row.db_schema_name.has_value()) {
+			return Status::Invalid("GetTables(include_schema=true) requires non-NULL catalog and schema for object ",
+			                      row.table_name);
+		}
+
+		auto qualified_name = QuoteIdentifier(row.catalog_name.value()) + "." + QuoteIdentifier(row.db_schema_name.value()) +
+		                      "." + QuoteIdentifier(row.table_name);
+		auto schema_sql = "SELECT * FROM " + qualified_name + " LIMIT 0";
+		auto schema_result = conn.Query(schema_sql);
+		if (!schema_result || schema_result->HasError()) {
+			return Status::Invalid("Failed to resolve schema for object ", qualified_name, ": ",
+			                      schema_result ? schema_result->GetError() : "Unknown DuckDB query failure");
+		}
+		ARROW_ASSIGN_OR_RAISE(auto arrow_schema, DuckDBSchemaToArrow(schema_result->types, schema_result->names,
+		                                                              schema_result->client_properties));
+		ARROW_ASSIGN_OR_RAISE(auto schema_buffer, arrow::ipc::SerializeSchema(*arrow_schema));
+		std::string_view schema_view(reinterpret_cast<const char *>(schema_buffer->data()),
+		                             NumericCast<size_t>(schema_buffer->size()));
+		ARROW_RETURN_NOT_OK(table_schema_builder.Append(schema_view));
+	}
+
+	ARROW_ASSIGN_OR_RAISE(auto catalog_array, catalog_builder.Finish());
+	ARROW_ASSIGN_OR_RAISE(auto schema_array, schema_builder.Finish());
+	ARROW_ASSIGN_OR_RAISE(auto table_name_array, table_name_builder.Finish());
+	ARROW_ASSIGN_OR_RAISE(auto table_type_array, table_type_builder.Finish());
+	ARROW_ASSIGN_OR_RAISE(auto table_schema_array, table_schema_builder.Finish());
+
+	auto batch = arrow::RecordBatch::Make(SqlSchema::GetTablesSchemaWithIncludedSchema(), NumericCast<int64_t>(rows.size()),
+	                                      {catalog_array, schema_array, table_name_array, table_type_array,
+	                                       table_schema_array});
+	ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make({batch}));
+	return std::make_unique<RecordBatchStream>(reader);
 }
 
 Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoTableTypes(const ServerCallContext & /*context*/,

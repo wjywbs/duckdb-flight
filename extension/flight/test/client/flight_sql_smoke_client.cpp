@@ -15,6 +15,8 @@
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/sql/client.h"
 #include "arrow/flight/sql/protocol_internal.h"
+#include "arrow/ipc/reader.h"
+#include "arrow/io/memory.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
 
@@ -131,6 +133,24 @@ arrow::Result<std::string> GetStringValue(const std::shared_ptr<arrow::Array> &a
 	}
 }
 
+arrow::Result<std::string> GetBinaryValue(const std::shared_ptr<arrow::Array> &array, int64_t row) {
+	if (array->IsNull(row)) {
+		return Status::Invalid("unexpected NULL binary value");
+	}
+	switch (array->type_id()) {
+	case arrow::Type::BINARY: {
+		auto view = std::static_pointer_cast<arrow::BinaryArray>(array)->GetView(row);
+		return std::string(view.data(), view.size());
+	}
+	case arrow::Type::LARGE_BINARY: {
+		auto view = std::static_pointer_cast<arrow::LargeBinaryArray>(array)->GetView(row);
+		return std::string(view.data(), view.size());
+	}
+	default:
+		return Status::TypeError("expected binary array but got ", array->type()->ToString());
+	}
+}
+
 arrow::Result<int64_t> FindColumnIndex(const std::shared_ptr<arrow::Table> &table, const std::string &name) {
 	for (int64_t i = 0; i < table->num_columns(); i++) {
 		if (table->field(i)->name() == name) {
@@ -149,6 +169,27 @@ arrow::Result<std::string> GetTableString(const std::shared_ptr<arrow::Table> &t
 		return Status::Invalid("expected one chunk for string column");
 	}
 	return GetStringValue(column->chunk(0), row_idx);
+}
+
+arrow::Result<std::string> GetTableBinary(const std::shared_ptr<arrow::Table> &table, int64_t col_idx, int64_t row_idx) {
+	if (col_idx >= table->num_columns()) {
+		return Status::Invalid("column index out of range");
+	}
+	const auto &column = table->column(col_idx);
+	if (column->num_chunks() != 1) {
+		return Status::Invalid("expected one chunk for binary column");
+	}
+	return GetBinaryValue(column->chunk(0), row_idx);
+}
+
+arrow::Result<std::shared_ptr<arrow::Schema>> ParseSerializedSchema(const std::string &schema_bytes) {
+	auto buffer = arrow::Buffer::FromString(schema_bytes);
+	arrow::io::BufferReader reader(buffer);
+	return arrow::ipc::ReadSchema(&reader, nullptr);
+}
+
+bool SchemaHasField(const std::shared_ptr<arrow::Schema> &schema, const std::string &field_name) {
+	return schema && schema->GetFieldByName(field_name) != nullptr;
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> ExecuteQuery(FlightSqlClient &client, const std::string &query) {
@@ -557,6 +598,11 @@ Status RunMetadata(FlightSqlClient &client) {
 		return fail_with_cleanup(tables_table_result.status());
 	}
 	auto tables_table = tables_table_result.MoveValueUnsafe();
+	if (tables_table->num_columns() != 4) {
+		return fail_with_cleanup(
+		    Status::Invalid("GetTables(include_schema=false) returned unexpected column count: ",
+		                    tables_table->num_columns()));
+	}
 	auto table_name_col_result = FindColumnIndex(tables_table, "table_name");
 	if (!table_name_col_result.ok()) {
 		return fail_with_cleanup(table_name_col_result.status());
@@ -626,6 +672,82 @@ Status RunMetadata(FlightSqlClient &client) {
 	if (!saw_only_meta_table) {
 		return fail_with_cleanup(
 		    Status::Invalid("GetTables table_type filter did not return expected table entry"));
+	}
+
+	auto tables_with_schema_info_result = client.GetTables({}, nullptr, &schema_pattern, &table_pattern, true, nullptr);
+	if (!tables_with_schema_info_result.ok()) {
+		return fail_with_cleanup(tables_with_schema_info_result.status());
+	}
+	auto tables_with_schema_result =
+	    FlightInfoToTable(client, tables_with_schema_info_result.MoveValueUnsafe(), "GetTables(include_schema)");
+	if (!tables_with_schema_result.ok()) {
+		return fail_with_cleanup(tables_with_schema_result.status());
+	}
+	auto tables_with_schema = tables_with_schema_result.MoveValueUnsafe();
+	if (tables_with_schema->num_columns() != 5) {
+		return fail_with_cleanup(
+		    Status::Invalid("GetTables(include_schema=true) returned unexpected column count: ",
+		                    tables_with_schema->num_columns()));
+	}
+	auto schema_table_name_col_result = FindColumnIndex(tables_with_schema, "table_name");
+	if (!schema_table_name_col_result.ok()) {
+		return fail_with_cleanup(schema_table_name_col_result.status());
+	}
+	auto schema_table_type_col_result = FindColumnIndex(tables_with_schema, "table_type");
+	if (!schema_table_type_col_result.ok()) {
+		return fail_with_cleanup(schema_table_type_col_result.status());
+	}
+	auto table_schema_col_result = FindColumnIndex(tables_with_schema, "table_schema");
+	if (!table_schema_col_result.ok()) {
+		return fail_with_cleanup(table_schema_col_result.status());
+	}
+	auto schema_table_name_col = schema_table_name_col_result.MoveValueUnsafe();
+	auto schema_table_type_col = schema_table_type_col_result.MoveValueUnsafe();
+	auto table_schema_col = table_schema_col_result.MoveValueUnsafe();
+	bool saw_meta_table_with_schema = false;
+	bool saw_meta_view_with_schema = false;
+	for (int64_t row = 0; row < tables_with_schema->num_rows(); row++) {
+		auto table_name_result = GetTableString(tables_with_schema, schema_table_name_col, row);
+		if (!table_name_result.ok()) {
+			return fail_with_cleanup(table_name_result.status());
+		}
+		auto table_type_result = GetTableString(tables_with_schema, schema_table_type_col, row);
+		if (!table_type_result.ok()) {
+			return fail_with_cleanup(table_type_result.status());
+		}
+		auto table_schema_bytes_result = GetTableBinary(tables_with_schema, table_schema_col, row);
+		if (!table_schema_bytes_result.ok()) {
+			return fail_with_cleanup(table_schema_bytes_result.status());
+		}
+		auto table_schema_bytes = table_schema_bytes_result.MoveValueUnsafe();
+		if (table_schema_bytes.empty()) {
+			return fail_with_cleanup(Status::Invalid("GetTables(include_schema=true) returned empty table_schema"));
+		}
+		auto parsed_schema_result = ParseSerializedSchema(table_schema_bytes);
+		if (!parsed_schema_result.ok()) {
+			return fail_with_cleanup(parsed_schema_result.status());
+		}
+		auto parsed_schema = parsed_schema_result.MoveValueUnsafe();
+
+		auto table_name = table_name_result.MoveValueUnsafe();
+		auto table_type = table_type_result.MoveValueUnsafe();
+		if (table_name == "flight_meta_tbl" && table_type == "TABLE") {
+			saw_meta_table_with_schema = true;
+			if (!SchemaHasField(parsed_schema, "id") || !SchemaHasField(parsed_schema, "val")) {
+				return fail_with_cleanup(Status::Invalid(
+				    "flight_meta_tbl serialized schema missing expected fields"));
+			}
+		} else if (table_name == "flight_meta_view" && table_type == "VIEW") {
+			saw_meta_view_with_schema = true;
+			if (!SchemaHasField(parsed_schema, "id") || !SchemaHasField(parsed_schema, "val")) {
+				return fail_with_cleanup(Status::Invalid(
+				    "flight_meta_view serialized schema missing expected fields"));
+			}
+		}
+	}
+	if (!saw_meta_table_with_schema || !saw_meta_view_with_schema) {
+		return fail_with_cleanup(Status::Invalid(
+		    "GetTables(include_schema=true) did not return expected table/view entries"));
 	}
 
 	cleanup();
