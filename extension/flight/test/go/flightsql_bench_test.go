@@ -17,12 +17,13 @@ import (
 )
 
 var (
-	flagHost      = flag.String("host", "127.0.0.1", "Flight SQL host")
-	flagPort      = flag.Int("port", 0, "Flight SQL port")
-	flagRows      = flag.Int("rows", 100000, "Number of rows for benchmark phases")
-	flagWorkers   = flag.Int("workers", 200, "Number of concurrent goroutines")
-	flagBatchSize = flag.Int("batch-size", 1000, "Batch size for batch insert phase")
-	flagCrudIters = flag.Int("crud-iters", 2000, "Iterations for single-operation CRUD latency phase")
+	flagHost        = flag.String("host", "127.0.0.1", "Flight SQL host")
+	flagPort        = flag.Int("port", 0, "Flight SQL port")
+	flagRows        = flag.Int("rows", 100000, "Number of rows for benchmark phases")
+	flagWorkers     = flag.Int("workers", 200, "Number of concurrent goroutines")
+	flagBatchSize   = flag.Int("batch-size", 1000, "Batch size for batch insert phase")
+	flagCrudIters   = flag.Int("crud-iters", 2000, "Iterations for single-operation CRUD latency phase")
+	flagSelectIters = flag.Int("select-iters", 2000, "Iterations for select prepare-mode benchmark phase")
 )
 
 const (
@@ -1084,6 +1085,86 @@ func runConcurrentTransactionCommitConflicts(t *testing.T, db *sql.DB, workers i
 	printOpMetric("concurrent_tx_conflict_failures", duration, conflicts)
 }
 
+func runSelectPrepareModes(t *testing.T, db *sql.DB, rows, iters int) {
+	t.Helper()
+	requirePositiveFlag(t, rows, "rows")
+	requirePositiveFlag(t, iters, "select-iters")
+
+	printPhaseStart("SELECT_PREPARE_MODES")
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("select prepare modes acquire conn failed: %v", err)
+	}
+	defer conn.Close()
+
+	selectSQL := "SELECT val FROM " + benchmarkTable + " WHERE id = ?"
+
+	start := time.Now()
+	for i := 0; i < iters; i++ {
+		id := int64(i%rows) + 1
+		query := fmt.Sprintf("SELECT val FROM %s WHERE id = %d", benchmarkTable, id)
+		var got int64
+		if err := conn.QueryRowContext(ctx, query).Scan(&got); err != nil {
+			t.Fatalf("select direct no-prepare failed at iter=%d id=%d: %v", i, id, err)
+		}
+		expected := expectedVal(id)
+		if got != expected {
+			t.Fatalf("select direct no-prepare mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expected)
+		}
+	}
+	directDuration := time.Since(start)
+	printOpMetric("select_point_direct_no_prepare", directDuration, int64(iters))
+
+	start = time.Now()
+	for i := 0; i < iters; i++ {
+		id := int64(i%rows) + 1
+		stmt, err := conn.PrepareContext(ctx, selectSQL)
+		if err != nil {
+			t.Fatalf("select prepare-each prepare failed at iter=%d: %v", i, err)
+		}
+		var got int64
+		queryErr := stmt.QueryRowContext(ctx, id).Scan(&got)
+		closeErr := stmt.Close()
+		if queryErr != nil {
+			t.Fatalf("select prepare-each query failed at iter=%d id=%d: %v", i, id, queryErr)
+		}
+		if closeErr != nil {
+			t.Fatalf("select prepare-each close failed at iter=%d: %v", i, closeErr)
+		}
+		expected := expectedVal(id)
+		if got != expected {
+			t.Fatalf("select prepare-each mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expected)
+		}
+	}
+	prepareEachDuration := time.Since(start)
+	printOpMetric("select_point_prepare_each_time", prepareEachDuration, int64(iters))
+
+	stmt, err := conn.PrepareContext(ctx, selectSQL)
+	if err != nil {
+		t.Fatalf("select prepare-once prepare failed: %v", err)
+	}
+	start = time.Now()
+	for i := 0; i < iters; i++ {
+		id := int64(i%rows) + 1
+		var got int64
+		if err := stmt.QueryRowContext(ctx, id).Scan(&got); err != nil {
+			_ = stmt.Close()
+			t.Fatalf("select prepare-once query failed at iter=%d id=%d: %v", i, id, err)
+		}
+		expected := expectedVal(id)
+		if got != expected {
+			_ = stmt.Close()
+			t.Fatalf("select prepare-once mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expected)
+		}
+	}
+	prepareReuseDuration := time.Since(start)
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("select prepare-once close failed: %v", err)
+	}
+	printOpMetric("select_point_prepare_once_reuse", prepareReuseDuration, int64(iters))
+}
+
 func runOrderedSingleRead(t *testing.T, db *sql.DB, rows int) {
 	t.Helper()
 	requirePositiveFlag(t, rows, "rows")
@@ -1293,6 +1374,7 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	requirePositiveFlag(t, *flagWorkers, "workers")
 	requirePositiveFlag(t, *flagBatchSize, "batch-size")
 	requirePositiveFlag(t, *flagCrudIters, "crud-iters")
+	requirePositiveFlag(t, *flagSelectIters, "select-iters")
 
 	db := openDB(t)
 	defer db.Close()
@@ -1300,6 +1382,7 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	runCrudSingleOpAutocommit(t, db, *flagCrudIters)
 	runBatchInsert(t, db, *flagRows, *flagBatchSize)
 	runConcurrentInsert(t, db, *flagRows, *flagWorkers)
+	runSelectPrepareModes(t, db, *flagRows, *flagSelectIters)
 	runConcurrentTransactionCommitRollback(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCreateDropInsertSelect(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCommitConflicts(t, db, *flagWorkers)
