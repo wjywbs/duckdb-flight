@@ -2,6 +2,7 @@ package goflightbench
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -202,6 +203,20 @@ func rawExecuteUpdateTx(ctx context.Context, tx *flightsql.Txn, query string) (i
 
 func rawQuoteString(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+}
+
+func isRawTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "deadline exceeded") ||
+		strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "timed out") ||
+		strings.Contains(text, "timeout")
 }
 
 func rawInferParamType(values [][]any, col int) (arrow.DataType, error) {
@@ -1632,6 +1647,31 @@ func TestPingRaw(t *testing.T) {
 	}
 	if got != 1 {
 		t.Fatalf("unexpected raw ping result: got=%d expected=1", got)
+	}
+}
+
+func TestQueryTimeoutRaw(t *testing.T) {
+	client := openRawClient(t)
+	defer client.Close()
+
+	// Use a genuinely long-running query so timeout behavior is exercised on active execution.
+	longRunningQuery := "SELECT COUNT(*)::BIGINT FROM range(300000000) t(i) WHERE hash(i) % 2 = 0"
+	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelTimeout()
+	if _, err := rawQueryInt64(timeoutCtx, client, longRunningQuery); err == nil {
+		t.Fatalf("expected timeout/deadline error for raw long-running query")
+	} else if !isRawTimeoutErr(err) {
+		t.Fatalf("expected timeout/deadline error, got: %v", err)
+	}
+
+	successCtx, cancelSuccess := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSuccess()
+	got, err := rawQueryInt64(successCtx, client, "SELECT 1")
+	if err != nil {
+		t.Fatalf("raw control query failed: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("unexpected raw control query result: got=%d expected=1", got)
 	}
 }
 
