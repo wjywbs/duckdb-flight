@@ -808,6 +808,10 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetStatement(
 	if (state_lookup.ok()) {
 		state = state_lookup.MoveValueUnsafe();
 	} else {
+		const auto current_statement_counter = prepared_statement_counter.load(std::memory_order_relaxed);
+		if (decoded.statement_id == 0 || decoded.statement_id > current_statement_counter) {
+			return Status::Invalid("Invalid statement ticket encoding");
+		}
 		ARROW_ASSIGN_OR_RAISE(auto fallback_entry,
 		                      CreateStatementPreparedState(decoded.query, decoded.transaction_id, decoded.statement_id));
 		state = fallback_entry.second;
