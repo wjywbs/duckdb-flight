@@ -108,6 +108,23 @@ static unique_ptr<FunctionData> SetTransactionTimeoutBind(ClientContext &, Table
 	return make_uniq<TimeoutBindData>(timeout_seconds);
 }
 
+static unique_ptr<FunctionData> SetPreparedTimeoutBind(ClientContext &, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &types, vector<string> &names) {
+	types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("status");
+	if (input.inputs.empty()) {
+		throw InvalidInputException("set_flight_sql_prepared_timeout_seconds(seconds) requires an argument");
+	}
+	if (input.inputs[0].IsNull()) {
+		throw InvalidInputException("Prepared statement timeout cannot be NULL");
+	}
+	auto timeout_seconds = input.inputs[0].GetValue<int64_t>();
+	if (timeout_seconds < 0) {
+		throw InvalidInputException("Prepared statement timeout must be >= 0 seconds");
+	}
+	return make_uniq<TimeoutBindData>(timeout_seconds);
+}
+
 static void StartFlightSQLServerFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	if (!ShouldRun(input)) {
 		return;
@@ -163,6 +180,25 @@ static void GetTransactionTimeoutFunction(ClientContext & /*context*/, TableFunc
 	output.SetValue(0, 0, Value::BIGINT(timeout_seconds));
 }
 
+static void SetPreparedTimeoutFunction(ClientContext & /*context*/, TableFunctionInput &input, DataChunk &output) {
+	if (!ShouldRun(input)) {
+		return;
+	}
+	auto timeout_seconds = input.bind_data->Cast<TimeoutBindData>().timeout_seconds;
+	auto status = flight::FlightService::Get().SetPreparedTimeoutSeconds(timeout_seconds);
+	output.SetCardinality(1);
+	output.SetValue(0, 0, status);
+}
+
+static void GetPreparedTimeoutFunction(ClientContext & /*context*/, TableFunctionInput &input, DataChunk &output) {
+	if (!ShouldRun(input)) {
+		return;
+	}
+	auto timeout_seconds = flight::FlightService::Get().GetPreparedTimeoutSeconds();
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(timeout_seconds));
+}
+
 static void RegisterFunctions(ExtensionLoader &loader) {
 	auto start_no_arg =
 	    TableFunction("start_flight_sql_server", {}, StartFlightSQLServerFunction, StartNoArgBind, RunOnceState::Init);
@@ -190,6 +226,14 @@ static void RegisterFunctions(ExtensionLoader &loader) {
 	auto get_timeout = TableFunction("get_flight_sql_transaction_timeout_seconds", {}, GetTransactionTimeoutFunction,
 	                                 BigIntResultBind, RunOnceState::Init);
 	loader.RegisterFunction(get_timeout);
+
+	auto set_prepared_timeout = TableFunction("set_flight_sql_prepared_timeout_seconds", {LogicalType::BIGINT},
+	                                          SetPreparedTimeoutFunction, SetPreparedTimeoutBind, RunOnceState::Init);
+	loader.RegisterFunction(set_prepared_timeout);
+
+	auto get_prepared_timeout = TableFunction("get_flight_sql_prepared_timeout_seconds", {}, GetPreparedTimeoutFunction,
+	                                          BigIntResultBind, RunOnceState::Init);
+	loader.RegisterFunction(get_prepared_timeout);
 }
 
 } // namespace

@@ -441,6 +441,16 @@ int64_t DuckDBFlightSqlServer::GetTransactionTimeoutSeconds() const {
 	return transaction_timeout_seconds.load(std::memory_order_relaxed);
 }
 
+void DuckDBFlightSqlServer::SetPreparedTimeoutSeconds(int64_t timeout_seconds) {
+	prepared_timeout_seconds.store(timeout_seconds, std::memory_order_relaxed);
+	UpdateTransactionSqlInfo();
+	sweeper_cv.notify_all();
+}
+
+int64_t DuckDBFlightSqlServer::GetPreparedTimeoutSeconds() const {
+	return prepared_timeout_seconds.load(std::memory_order_relaxed);
+}
+
 Result<ActionBeginTransactionResult> DuckDBFlightSqlServer::BeginTransaction(const ServerCallContext & /*context*/,
                                                                              const ActionBeginTransactionRequest & /*request*/) {
 	auto transaction_state = std::make_shared<TransactionState>();
@@ -1207,14 +1217,21 @@ void DuckDBFlightSqlServer::UpdateTransactionSqlInfo() {
 	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_TRANSACTION,
 	                SqlInfoResult(int64_t(SqlInfoOptions::SqlSupportedTransaction::SQL_SUPPORTED_TRANSACTION_TRANSACTION)));
 
-	auto timeout_seconds = transaction_timeout_seconds.load(std::memory_order_relaxed);
-	int64_t timeout_millis = 0;
-	if (timeout_seconds > 0) {
+	auto transaction_seconds = transaction_timeout_seconds.load(std::memory_order_relaxed);
+	int64_t transaction_timeout_millis = 0;
+	if (transaction_seconds > 0) {
 		const auto max_seconds = std::numeric_limits<int64_t>::max() / 1000;
-		timeout_millis = timeout_seconds > max_seconds ? std::numeric_limits<int64_t>::max() : timeout_seconds * 1000;
+		transaction_timeout_millis = transaction_seconds > max_seconds ? std::numeric_limits<int64_t>::max() : transaction_seconds * 1000;
 	}
-	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_STATEMENT_TIMEOUT, SqlInfoResult(timeout_millis));
-	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_TRANSACTION_TIMEOUT, SqlInfoResult(timeout_millis));
+
+	auto prepared_seconds = prepared_timeout_seconds.load(std::memory_order_relaxed);
+	int64_t prepared_timeout_millis = 0;
+	if (prepared_seconds > 0) {
+		const auto max_seconds = std::numeric_limits<int64_t>::max() / 1000;
+		prepared_timeout_millis = prepared_seconds > max_seconds ? std::numeric_limits<int64_t>::max() : prepared_seconds * 1000;
+	}
+	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_STATEMENT_TIMEOUT, SqlInfoResult(prepared_timeout_millis));
+	RegisterSqlInfo(SqlInfoOptions::SqlInfo::FLIGHT_SQL_SERVER_TRANSACTION_TIMEOUT, SqlInfoResult(transaction_timeout_millis));
 }
 
 Status DuckDBFlightSqlServer::FinalizeTransaction(const std::shared_ptr<TransactionState> &transaction_state, bool commit) {
@@ -1280,107 +1297,116 @@ void DuckDBFlightSqlServer::RunTransactionSweeper() {
 			break;
 		}
 
-		auto timeout_seconds = transaction_timeout_seconds.load(std::memory_order_relaxed);
-		if (timeout_seconds <= 0) {
+		auto transaction_timeout_seconds_local = transaction_timeout_seconds.load(std::memory_order_relaxed);
+		auto prepared_timeout_seconds_local = prepared_timeout_seconds.load(std::memory_order_relaxed);
+		auto transaction_timeout_enabled = transaction_timeout_seconds_local > 0;
+		auto prepared_timeout_enabled = prepared_timeout_seconds_local > 0;
+		if (!transaction_timeout_enabled && !prepared_timeout_enabled) {
 			continue;
 		}
 
-		std::vector<std::pair<uint64_t, std::shared_ptr<TransactionState>>> snapshot;
-		{
-			std::lock_guard<std::mutex> guard(transactions_mutex);
-			snapshot.reserve(transactions.size());
-			for (auto &entry : transactions) {
-				snapshot.push_back(entry);
-			}
-		}
-
-		const auto now_ms = CurrentTimeMillis();
-		const auto timeout_ms = NumericCast<uint64_t>(timeout_seconds) * 1000;
-		for (auto &entry : snapshot) {
-			auto transaction_id = entry.first;
-			auto &transaction_state = entry.second;
-			auto last_activity_ms = transaction_state->last_activity_ms.load(std::memory_order_relaxed);
-			if (now_ms <= last_activity_ms || now_ms - last_activity_ms < timeout_ms) {
-				continue;
-			}
-
-			std::unique_lock<std::shared_mutex> transaction_lock(transaction_state->mutex, std::try_to_lock);
-			if (!transaction_lock.owns_lock()) {
-				continue;
-			}
-
-			last_activity_ms = transaction_state->last_activity_ms.load(std::memory_order_relaxed);
-			const auto recheck_now_ms = CurrentTimeMillis();
-			if (recheck_now_ms <= last_activity_ms || recheck_now_ms - last_activity_ms < timeout_ms) {
-				continue;
-			}
-
-			bool removed = false;
+		if (transaction_timeout_enabled) {
+			std::vector<std::pair<uint64_t, std::shared_ptr<TransactionState>>> snapshot;
 			{
 				std::lock_guard<std::mutex> guard(transactions_mutex);
-				auto current_entry = transactions.find(transaction_id);
-				if (current_entry != transactions.end() && current_entry->second == transaction_state) {
-					transactions.erase(current_entry);
-					removed = true;
+				snapshot.reserve(transactions.size());
+				for (auto &entry : transactions) {
+					snapshot.push_back(entry);
 				}
 			}
-			if (!removed) {
-				continue;
-			}
 
-			try {
-				if (transaction_state->connection) {
-					transaction_state->connection->Rollback();
+			const auto now_ms = CurrentTimeMillis();
+			const auto timeout_ms = NumericCast<uint64_t>(transaction_timeout_seconds_local) * 1000;
+			for (auto &entry : snapshot) {
+				auto transaction_id = entry.first;
+				auto &transaction_state = entry.second;
+				auto last_activity_ms = transaction_state->last_activity_ms.load(std::memory_order_relaxed);
+				if (now_ms <= last_activity_ms || now_ms - last_activity_ms < timeout_ms) {
+					continue;
 				}
-			} catch (...) {
+
+				std::unique_lock<std::shared_mutex> transaction_lock(transaction_state->mutex, std::try_to_lock);
+				if (!transaction_lock.owns_lock()) {
+					continue;
+				}
+
+				last_activity_ms = transaction_state->last_activity_ms.load(std::memory_order_relaxed);
+				const auto recheck_now_ms = CurrentTimeMillis();
+				if (recheck_now_ms <= last_activity_ms || recheck_now_ms - last_activity_ms < timeout_ms) {
+					continue;
+				}
+
+				bool removed = false;
+				{
+					std::lock_guard<std::mutex> guard(transactions_mutex);
+					auto current_entry = transactions.find(transaction_id);
+					if (current_entry != transactions.end() && current_entry->second == transaction_state) {
+						transactions.erase(current_entry);
+						removed = true;
+					}
+				}
+				if (!removed) {
+					continue;
+				}
+
+				try {
+					if (transaction_state->connection) {
+						transaction_state->connection->Rollback();
+					}
+				} catch (...) {
+				}
+				RemovePreparedStatements(transaction_state->owned_prepared_handles);
+				transaction_state->owned_prepared_handles.clear();
+				transaction_lock.unlock();
 			}
-			RemovePreparedStatements(transaction_state->owned_prepared_handles);
-			transaction_state->owned_prepared_handles.clear();
-			transaction_lock.unlock();
 		}
 
-		std::vector<std::pair<uint64_t, std::shared_ptr<PreparedStatementState>>> prepared_snapshot;
-		{
-			std::lock_guard<std::mutex> guard(prepared_statements_mutex);
-			prepared_snapshot.reserve(prepared_statements.size());
-			for (auto &entry : prepared_statements) {
-				prepared_snapshot.push_back(entry);
-			}
-		}
-
-		const auto prepared_now_ms = CurrentTimeMillis();
-		for (auto &entry : prepared_snapshot) {
-			auto prepared_id = entry.first;
-			auto &prepared_state = entry.second;
-			auto last_activity_ms = prepared_state->last_activity_ms.load(std::memory_order_relaxed);
-			if (prepared_now_ms <= last_activity_ms || prepared_now_ms - last_activity_ms < timeout_ms) {
-				continue;
+		if (prepared_timeout_enabled) {
+			std::vector<std::pair<uint64_t, std::shared_ptr<PreparedStatementState>>> prepared_snapshot;
+			{
+				std::lock_guard<std::mutex> guard(prepared_statements_mutex);
+				prepared_snapshot.reserve(prepared_statements.size());
+				for (auto &entry : prepared_statements) {
+					prepared_snapshot.push_back(entry);
+				}
 			}
 
-			std::unique_lock<std::shared_mutex> prepared_lock(prepared_state->mutex, std::try_to_lock);
-			if (!prepared_lock.owns_lock()) {
-				continue;
-			}
+			const auto prepared_now_ms = CurrentTimeMillis();
+			const auto prepared_timeout_ms = NumericCast<uint64_t>(prepared_timeout_seconds_local) * 1000;
+			for (auto &entry : prepared_snapshot) {
+				auto prepared_id = entry.first;
+				auto &prepared_state = entry.second;
+				auto last_activity_ms = prepared_state->last_activity_ms.load(std::memory_order_relaxed);
+				if (prepared_now_ms <= last_activity_ms || prepared_now_ms - last_activity_ms < prepared_timeout_ms) {
+					continue;
+				}
 
-			last_activity_ms = prepared_state->last_activity_ms.load(std::memory_order_relaxed);
-			const auto prepared_recheck_now_ms = CurrentTimeMillis();
-			if (prepared_recheck_now_ms <= last_activity_ms || prepared_recheck_now_ms - last_activity_ms < timeout_ms) {
-				continue;
-			}
+				std::unique_lock<std::shared_mutex> prepared_lock(prepared_state->mutex, std::try_to_lock);
+				if (!prepared_lock.owns_lock()) {
+					continue;
+				}
 
-			bool has_linked_transaction = false;
-			if (prepared_state->transaction_owner.has_value()) {
-				std::lock_guard<std::mutex> guard(transactions_mutex);
-				has_linked_transaction = transactions.find(prepared_state->transaction_owner.value()) != transactions.end();
-			}
-			if (has_linked_transaction) {
-				continue;
-			}
+				last_activity_ms = prepared_state->last_activity_ms.load(std::memory_order_relaxed);
+				const auto prepared_recheck_now_ms = CurrentTimeMillis();
+				if (prepared_recheck_now_ms <= last_activity_ms ||
+				    prepared_recheck_now_ms - last_activity_ms < prepared_timeout_ms) {
+					continue;
+				}
 
-			std::lock_guard<std::mutex> guard(prepared_statements_mutex);
-			auto current_entry = prepared_statements.find(prepared_id);
-			if (current_entry != prepared_statements.end() && current_entry->second == prepared_state) {
-				prepared_statements.erase(current_entry);
+				bool has_linked_transaction = false;
+				if (prepared_state->transaction_owner.has_value()) {
+					std::lock_guard<std::mutex> guard(transactions_mutex);
+					has_linked_transaction = transactions.find(prepared_state->transaction_owner.value()) != transactions.end();
+				}
+				if (has_linked_transaction) {
+					continue;
+				}
+
+				std::lock_guard<std::mutex> guard(prepared_statements_mutex);
+				auto current_entry = prepared_statements.find(prepared_id);
+				if (current_entry != prepared_statements.end() && current_entry->second == prepared_state) {
+					prepared_statements.erase(current_entry);
+				}
 			}
 		}
 	}

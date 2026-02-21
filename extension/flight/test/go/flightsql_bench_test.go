@@ -225,6 +225,14 @@ func isTimeoutErr(err error) bool {
 		strings.Contains(text, "timeout")
 }
 
+func isPreparedStatementNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "prepared statement not found")
+}
+
 func buildBatchInsertSQL(startID int64, size int) (string, []any) {
 	var builder strings.Builder
 	builder.WriteString("INSERT INTO ")
@@ -1531,6 +1539,80 @@ func TestQueryTimeoutDatabaseSQL(t *testing.T) {
 	}
 	if got != 1 {
 		t.Fatalf("unexpected control query result: got=%d expected=1", got)
+	}
+}
+
+func TestPreparedStatementTimeoutDatabaseSQL(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+
+	// Prepared-handle timeout is configured independently from transaction timeout.
+	var timeoutSet string
+	if err := db.QueryRow("CALL set_flight_sql_prepared_timeout_seconds(1)").Scan(&timeoutSet); err != nil {
+		t.Fatalf("set timeout failed: %v", err)
+	}
+	var timeoutNow int64
+	if err := db.QueryRow("SELECT timeout_seconds FROM get_flight_sql_prepared_timeout_seconds()").Scan(&timeoutNow); err != nil {
+		t.Fatalf("get prepared timeout failed: %v", err)
+	}
+	if timeoutNow != 1 {
+		t.Fatalf("unexpected prepared timeout after set: got=%d expected=1", timeoutNow)
+	}
+	defer func() {
+		var timeoutReset string
+		if err := db.QueryRow("CALL set_flight_sql_prepared_timeout_seconds(1800)").Scan(&timeoutReset); err != nil {
+			t.Fatalf("reset timeout failed: %v", err)
+		}
+	}()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn failed: %v", err)
+	}
+	defer conn.Close()
+
+	stmt, err := conn.PrepareContext(ctx, "SELECT ?::BIGINT AS v")
+	if err != nil {
+		t.Fatalf("PrepareContext failed: %v", err)
+	}
+	defer stmt.Close()
+
+	var first int64
+	if err := stmt.QueryRowContext(ctx, int64(7)).Scan(&first); err != nil {
+		t.Fatalf("initial prepared query failed: %v", err)
+	}
+	if first != 7 {
+		t.Fatalf("unexpected initial prepared result: got=%d expected=7", first)
+	}
+
+	// Wait long enough for server sweeper to reap idle non-tx prepared handles.
+	time.Sleep(3500 * time.Millisecond)
+
+	var second int64
+	err = stmt.QueryRowContext(ctx, int64(8)).Scan(&second)
+	if err == nil {
+		t.Fatalf("expected stale prepared handle error after timeout")
+	}
+	if !isPreparedStatementNotFoundErr(err) {
+		t.Fatalf("expected prepared statement not found error, got: %v", err)
+	}
+
+	// database/sql + Arrow Flight SQL driver does not auto-recreate a timed-out prepared handle.
+	// Recommended client pattern: detect this error, re-prepare, then retry once.
+	_ = stmt.Close()
+	stmt, err = conn.PrepareContext(ctx, "SELECT ?::BIGINT AS v")
+	if err != nil {
+		t.Fatalf("re-PrepareContext failed: %v", err)
+	}
+	defer stmt.Close()
+
+	var recovered int64
+	if err := stmt.QueryRowContext(ctx, int64(9)).Scan(&recovered); err != nil {
+		t.Fatalf("query after re-prepare failed: %v", err)
+	}
+	if recovered != 9 {
+		t.Fatalf("unexpected result after re-prepare: got=%d expected=9", recovered)
 	}
 }
 
