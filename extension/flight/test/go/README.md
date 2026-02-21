@@ -73,7 +73,6 @@ go test -v -count=1 -run '^TestFlightSQLBenchmarksRaw$' ./... -args \
 - Ordered concurrent shard scans with correctness checks
 - Ordered concurrent full-table scans with correctness checks (no sharding)
 - Raw Flight SQL API end-to-end benchmark suite mirroring the above phases
-- Raw-vs-`database/sql` select-mode overhead comparison phase
 
 ## Concurrent Transaction Benchmark
 
@@ -312,12 +311,6 @@ Setup used:
 | `select_ordered_single_rows` | 6015846.70 | `raw_select_ordered_single_rows` | 9360450.06 | 1.556 |
 | `select_ordered_concurrent_rows` | 2548918.72 | `raw_select_ordered_concurrent_rows` | 1976086.27 | 0.775 |
 | `select_ordered_concurrent_full_rows` | 39293477.42 | `raw_select_ordered_concurrent_full_rows` | 44830076.65 | 1.141 |
-
-Additional raw built-in wrapper comparison (`RAW_VS_DATABASE_SQL_SELECT_OVERHEAD`) from the same run:
-
-- `compare_select_direct_no_prepare_sql_over_raw=0.996x`
-- `compare_select_prepare_each_time_sql_over_raw=1.053x`
-- `compare_select_prepare_once_reuse_sql_over_raw=1.063x`
 
 Summary:
 
