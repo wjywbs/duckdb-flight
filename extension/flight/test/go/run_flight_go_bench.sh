@@ -178,6 +178,14 @@ if [[ "${ready}" -ne 1 ]]; then
   exit 1
 fi
 
+echo "Running Go Flight SQL quick timeout/connectivity tests..."
+(
+  cd "${SCRIPT_DIR}" &&
+  go test -v -count=1 -run 'TestPing|TestQueryTimeoutDatabaseSQL|TestPingRaw|TestQueryTimeoutRaw' ./... -args \
+    -host "${HOST}" \
+    -port "${PORT}"
+)
+
 echo "Running Go Flight SQL benchmark test..."
 (
   cd "${SCRIPT_DIR}" &&

@@ -38,9 +38,14 @@ The script:
 1. Builds DuckDB with `flight` if needed.
 2. Starts `duckdb -flight-sql` on a file-backed database.
 3. Waits for readiness using `TestPing`.
-4. Runs `TestFlightSQLBenchmarks`.
-5. Prints benchmark timings and DB file size.
-6. Shuts down and removes temp files (unless `--keep-db` is set).
+4. Runs lightweight timeout/connectivity tests:
+   - `TestPing`
+   - `TestQueryTimeoutDatabaseSQL`
+   - `TestPingRaw`
+   - `TestQueryTimeoutRaw`
+5. Runs `TestFlightSQLBenchmarks`.
+6. Prints benchmark timings and DB file size.
+7. Shuts down and removes temp files (unless `--keep-db` is set).
 
 To run the raw Flight SQL API benchmark directly (without `database/sql` wrapper):
 
@@ -55,6 +60,12 @@ go test -v -count=1 -run '^TestFlightSQLBenchmarksRaw$' ./... -args \
   -crud-iters 2000 \
   -select-iters 2000
 ```
+
+## Client-Side Timeout Controls
+
+- C++ Flight SQL client path uses `arrow::flight::FlightCallOptions.timeout`.
+- Go `database/sql` path uses `context` deadlines (`QueryContext`/`ExecContext`) and DSN default timeout (`flightsql://...?...&timeout=<duration>`).
+- Go raw Flight SQL path uses `context.WithTimeout(...)` per call (and can also pass gRPC call options).
 
 ## Workload
 
