@@ -12,6 +12,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "duckdb.hpp"
 
@@ -117,6 +118,7 @@ private:
 	    const arrow::flight::FlightDescriptor &descriptor, const std::shared_ptr<arrow::Schema> &schema,
 	    bool ordered = false);
 	arrow::Result<std::shared_ptr<PreparedStatementState>> LookupPreparedStatement(const std::string &handle);
+	arrow::Result<std::shared_ptr<PreparedStatementState>> LookupPreparedStatement(uint64_t handle_id);
 	arrow::Result<std::shared_ptr<TransactionState>> LookupTransaction(const std::string &handle);
 	arrow::Result<std::shared_ptr<TransactionState>> LookupTransaction(uint64_t transaction_id);
 	arrow::Result<uint64_t> DecodePreparedHandle(const std::string &encoded_handle) const;
@@ -138,6 +140,10 @@ private:
 	void UpdateTransactionSqlInfo();
 	arrow::Result<unique_ptr<QueryResult>> QueryInTransaction(const std::shared_ptr<TransactionState> &transaction_state,
 	                                                          const std::string &sql, bool streaming);
+	arrow::Result<std::pair<uint64_t, std::shared_ptr<PreparedStatementState>>> CreateStatementPreparedState(
+	    const std::string &query, const std::optional<uint64_t> &transaction_id,
+	    std::optional<uint64_t> forced_statement_id = std::nullopt);
+	void RemoveTransactionOwnedPreparedHandle(uint64_t transaction_id, uint64_t statement_id);
 	arrow::Status FinalizeTransaction(const std::shared_ptr<TransactionState> &transaction_state, bool commit);
 	arrow::Status RemovePreparedStatement(uint64_t handle_id, bool error_if_missing);
 	void RemovePreparedStatements(const std::unordered_set<uint64_t> &handle_ids);
