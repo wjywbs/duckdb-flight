@@ -478,6 +478,24 @@ Status RunPing(FlightSqlClient &client) {
 }
 
 Status RunCrud(FlightSqlClient &client) {
+	auto cleanup = [&client]() {
+		(void)ExecuteUpdate(client, "DROP SEQUENCE IF EXISTS flight_stmt_seq", std::nullopt);
+		(void)ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_it", std::nullopt);
+	};
+	ARROW_RETURN_NOT_OK(ExecuteUpdate(client, "DROP SEQUENCE IF EXISTS flight_stmt_seq", std::nullopt));
+	ARROW_RETURN_NOT_OK(ExecuteUpdate(client, "CREATE SEQUENCE flight_stmt_seq START 1", std::nullopt));
+	ARROW_ASSIGN_OR_RAISE(auto sequence_table, ExecuteQuery(client, "SELECT nextval('flight_stmt_seq')::BIGINT AS v"));
+	if (sequence_table->num_columns() != 1 || sequence_table->num_rows() != 1 || sequence_table->column(0)->num_chunks() != 1) {
+		cleanup();
+		return Status::Invalid("statement single-execution check returned unexpected shape");
+	}
+	ARROW_ASSIGN_OR_RAISE(auto sequence_value, GetIntValue(sequence_table->column(0)->chunk(0), 0));
+	if (sequence_value != 1) {
+		cleanup();
+		return Status::Invalid("statement single-execution check failed: expected first nextval=1, got ",
+		                      sequence_value);
+	}
+
 	ARROW_RETURN_NOT_OK(
 	    ExecuteUpdate(client, "CREATE TABLE flight_it (id INTEGER, val VARCHAR)", std::nullopt));
 	ARROW_RETURN_NOT_OK(
@@ -525,8 +543,10 @@ Status RunCrud(FlightSqlClient &client) {
 	}
 	ARROW_ASSIGN_OR_RAISE(auto count, GetIntValue(count_table->column(0)->chunk(0), 0));
 	if (count != 0) {
+		cleanup();
 		return Status::Invalid("flight_it table still exists after DROP TABLE");
 	}
+	ARROW_RETURN_NOT_OK(ExecuteUpdate(client, "DROP SEQUENCE IF EXISTS flight_stmt_seq", std::nullopt));
 	return Status::OK();
 }
 

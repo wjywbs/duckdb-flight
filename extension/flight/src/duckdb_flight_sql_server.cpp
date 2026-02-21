@@ -66,7 +66,8 @@ struct PreparedParameterDefinition {
 	idx_t position;
 };
 
-struct DecodedStatementHandle {
+struct DecodedStatementTicket {
+	uint64_t statement_id;
 	std::string query;
 	std::optional<uint64_t> transaction_id;
 };
@@ -143,9 +144,13 @@ static Result<uint64_t> DecodeHandleLE(const std::string &encoded_handle, const 
 	return value;
 }
 
-static std::string EncodeStatementHandle(const std::string &sql, const std::optional<uint64_t> &transaction_id) {
+static std::string EncodeStatementTicket(uint64_t statement_id, const std::string &sql,
+                                         const std::optional<uint64_t> &transaction_id) {
+	static constexpr uint8_t kStatementTicketVersion = 1;
 	std::string encoded;
-	encoded.reserve(1 + sql.size() + (transaction_id.has_value() ? 8 : 0));
+	encoded.reserve(1 + 8 + 1 + sql.size() + (transaction_id.has_value() ? 8 : 0));
+	encoded.push_back(static_cast<char>(kStatementTicketVersion));
+	encoded += EncodeHandleLE(statement_id);
 	encoded.push_back(transaction_id.has_value() ? '\x01' : '\x00');
 	if (transaction_id.has_value()) {
 		encoded += EncodeHandleLE(transaction_id.value());
@@ -154,21 +159,30 @@ static std::string EncodeStatementHandle(const std::string &sql, const std::opti
 	return encoded;
 }
 
-static Result<DecodedStatementHandle> DecodeStatementHandle(const std::string &statement_handle) {
-	if (statement_handle.empty()) {
+static Result<DecodedStatementTicket> DecodeStatementTicket(const std::string &statement_ticket) {
+	static constexpr uint8_t kStatementTicketVersion = 1;
+	if (statement_ticket.size() < 10) {
 		return Status::Invalid("Invalid statement ticket encoding");
 	}
-	DecodedStatementHandle decoded;
-	const auto flag = static_cast<uint8_t>(statement_handle[0]);
-	if (flag == 0) {
-		decoded.query = statement_handle.substr(1);
+	if (static_cast<uint8_t>(statement_ticket[0]) != kStatementTicketVersion) {
+		return Status::Invalid("Invalid statement ticket encoding");
+	}
+
+	DecodedStatementTicket decoded;
+	ARROW_ASSIGN_OR_RAISE(decoded.statement_id,
+	                      DecodeHandleLE(statement_ticket.substr(1, 8), "Invalid statement ticket encoding"));
+
+	const auto has_transaction_id = static_cast<uint8_t>(statement_ticket[9]);
+	if (has_transaction_id == 0) {
+		decoded.query = statement_ticket.substr(10);
 		return decoded;
 	}
-	if (flag != 1 || statement_handle.size() < 9) {
+	if (has_transaction_id != 1 || statement_ticket.size() < 18) {
 		return Status::Invalid("Invalid statement ticket encoding");
 	}
-	ARROW_ASSIGN_OR_RAISE(decoded.transaction_id, DecodeHandleLE(statement_handle.substr(1, 8), "Invalid statement ticket encoding"));
-	decoded.query = statement_handle.substr(9);
+	ARROW_ASSIGN_OR_RAISE(decoded.transaction_id,
+	                      DecodeHandleLE(statement_ticket.substr(10, 8), "Invalid statement ticket encoding"));
+	decoded.query = statement_ticket.substr(18);
 	return decoded;
 }
 
@@ -297,8 +311,9 @@ static std::vector<PreparedParameterDefinition> BuildOrderedParameters(PreparedS
 class LockedFlightDataStream : public FlightDataStream {
 public:
 	LockedFlightDataStream(std::unique_ptr<FlightDataStream> inner_p, std::unique_lock<std::shared_mutex> lock_p,
-	                       std::shared_ptr<void> state_guard_p)
-	    : inner(std::move(inner_p)), lock(std::move(lock_p)), state_guard(std::move(state_guard_p)) {
+	                       std::shared_ptr<void> state_guard_p, std::function<void()> on_close_p = {})
+	    : inner(std::move(inner_p)), lock(std::move(lock_p)), state_guard(std::move(state_guard_p)),
+	      on_close(std::move(on_close_p)) {
 	}
 
 	~LockedFlightDataStream() override {
@@ -332,11 +347,16 @@ private:
 		if (lock.owns_lock()) {
 			lock.unlock();
 		}
+		if (on_close) {
+			on_close();
+			on_close = nullptr;
+		}
 	}
 
 	std::unique_ptr<FlightDataStream> inner;
 	std::unique_lock<std::shared_mutex> lock;
 	std::shared_ptr<void> state_guard;
+	std::function<void()> on_close;
 	bool finalized = false;
 };
 
@@ -547,6 +567,11 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoForSchem
 Result<std::shared_ptr<DuckDBFlightSqlServer::PreparedStatementState>>
 DuckDBFlightSqlServer::LookupPreparedStatement(const std::string &handle) {
 	ARROW_ASSIGN_OR_RAISE(auto handle_id, DecodePreparedHandle(handle));
+	return LookupPreparedStatement(handle_id);
+}
+
+Result<std::shared_ptr<DuckDBFlightSqlServer::PreparedStatementState>>
+DuckDBFlightSqlServer::LookupPreparedStatement(uint64_t handle_id) {
 	std::lock_guard<std::mutex> guard(prepared_statements_mutex);
 	auto entry = prepared_statements.find(handle_id);
 	if (entry == prepared_statements.end()) {
@@ -658,28 +683,106 @@ DuckDBFlightSqlServer::QueryInTransaction(const std::shared_ptr<TransactionState
 	return result;
 }
 
+Result<std::pair<uint64_t, std::shared_ptr<DuckDBFlightSqlServer::PreparedStatementState>>>
+DuckDBFlightSqlServer::CreateStatementPreparedState(const std::string &query, const std::optional<uint64_t> &transaction_id,
+                                                    std::optional<uint64_t> forced_statement_id) {
+	auto state = std::make_shared<PreparedStatementState>();
+	std::shared_ptr<TransactionState> transaction_state;
+	std::unique_lock<std::shared_mutex> transaction_lock;
+
+	if (transaction_id.has_value()) {
+		ARROW_ASSIGN_OR_RAISE(transaction_state, LookupTransaction(transaction_id.value()));
+		transaction_lock = std::unique_lock<std::shared_mutex>(transaction_state->mutex);
+		state->transaction_owner = transaction_id;
+		state->prepared = transaction_state->connection->Prepare(query);
+	} else {
+		state->connection = make_uniq<Connection>(*db);
+		state->prepared = state->connection->Prepare(query);
+	}
+	if (!state->prepared || state->prepared->HasError()) {
+		return Status::Invalid(state->prepared ? state->prepared->GetError() : "Unknown DuckDB prepared statement failure");
+	}
+
+	state->ordered_parameters = BuildOrderedParameters(*state->prepared);
+	if (!state->ordered_parameters.empty()) {
+		return Status::Invalid("Statement query does not support parameterized SQL");
+	}
+
+	ClientProperties client_properties;
+	if (transaction_state) {
+		client_properties = transaction_state->connection->context->GetClientProperties();
+	} else {
+		client_properties = state->connection->context->GetClientProperties();
+	}
+	ARROW_ASSIGN_OR_RAISE(state->dataset_schema,
+	                      DuckDBSchemaToArrow(state->prepared->GetTypes(), state->prepared->GetNames(), client_properties));
+	state->query_bound_parameters = case_insensitive_map_t<BoundParameterData> {};
+
+	uint64_t statement_id = forced_statement_id.value_or(prepared_statement_counter.fetch_add(1, std::memory_order_relaxed) + 1);
+	std::shared_ptr<PreparedStatementState> mapped_state;
+	bool inserted = false;
+	{
+		std::lock_guard<std::mutex> guard(prepared_statements_mutex);
+		auto entry = prepared_statements.find(statement_id);
+		if (entry == prepared_statements.end()) {
+			prepared_statements.emplace(statement_id, state);
+			mapped_state = state;
+			inserted = true;
+		} else {
+			mapped_state = entry->second;
+		}
+	}
+
+	if (inserted) {
+		state->UpdateActivityTime();
+		if (transaction_state) {
+			transaction_state->owned_prepared_handles.insert(statement_id);
+			transaction_state->UpdateActivityTime();
+		}
+	} else if (transaction_state) {
+		transaction_state->UpdateActivityTime();
+	}
+
+	return std::make_pair(statement_id, mapped_state);
+}
+
+void DuckDBFlightSqlServer::RemoveTransactionOwnedPreparedHandle(uint64_t transaction_id, uint64_t statement_id) {
+	std::shared_ptr<TransactionState> transaction_state;
+	{
+		std::lock_guard<std::mutex> guard(transactions_mutex);
+		auto entry = transactions.find(transaction_id);
+		if (entry == transactions.end()) {
+			return;
+		}
+		transaction_state = entry->second;
+	}
+
+	std::unique_lock<std::shared_mutex> lock(transaction_state->mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return;
+	}
+	transaction_state->owned_prepared_handles.erase(statement_id);
+}
+
 Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoStatement(const ServerCallContext & /*context*/,
                                                                                    const StatementQuery &command,
                                                                                    const FlightDescriptor &descriptor) {
 	std::optional<uint64_t> transaction_id;
-	unique_ptr<QueryResult> result;
-	if (command.transaction_id.empty()) {
-		Connection conn(*db);
-		result = conn.SendQuery(command.query);
-	} else {
+	if (!command.transaction_id.empty()) {
 		ARROW_ASSIGN_OR_RAISE(transaction_id, DecodeTransactionHandle(command.transaction_id));
-		ARROW_ASSIGN_OR_RAISE(auto transaction_state, LookupTransaction(transaction_id.value()));
-		std::unique_lock<std::shared_mutex> transaction_lock(transaction_state->mutex);
-		ARROW_ASSIGN_OR_RAISE(result, QueryInTransaction(transaction_state, command.query, true));
-	}
-	if (!result || result->HasError()) {
-		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
 
-	ARROW_ASSIGN_OR_RAISE(auto schema_result,
-	                      DuckDBSchemaToArrow(result->types, result->names, result->client_properties));
+	ARROW_ASSIGN_OR_RAISE(auto statement_entry, CreateStatementPreparedState(command.query, transaction_id));
+	auto statement_id = statement_entry.first;
+	auto state = statement_entry.second;
+	std::shared_ptr<Schema> schema_result;
+	{
+		std::shared_lock<std::shared_mutex> state_lock(state->mutex);
+		schema_result = state->dataset_schema;
+	}
+	state->UpdateActivityTime();
 
-	const auto statement_handle = EncodeStatementHandle(command.query, transaction_id);
+	const auto statement_handle = EncodeStatementTicket(statement_id, command.query, transaction_id);
 	ARROW_ASSIGN_OR_RAISE(auto ticket_str, CreateStatementQueryTicket(statement_handle));
 	std::vector<FlightEndpoint> endpoints {FlightEndpoint {Ticket {std::move(ticket_str)}, {}, std::nullopt, ""}};
 	ARROW_ASSIGN_OR_RAISE(auto info, FlightInfo::Make(*schema_result, descriptor, endpoints, -1, -1, false));
@@ -688,12 +791,70 @@ Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoStatemen
 
 Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetStatement(const ServerCallContext & /*context*/,
                                                                                 const StatementQueryTicket &command) {
-	ARROW_ASSIGN_OR_RAISE(auto decoded, DecodeStatementHandle(command.statement_handle));
-	if (decoded.transaction_id.has_value()) {
-		ARROW_ASSIGN_OR_RAISE(auto transaction_state, LookupTransaction(decoded.transaction_id.value()));
-		return StreamSQLInTransaction(transaction_state, decoded.query);
+	ARROW_ASSIGN_OR_RAISE(auto decoded, DecodeStatementTicket(command.statement_handle));
+
+	std::shared_ptr<PreparedStatementState> state;
+	auto state_lookup = LookupPreparedStatement(decoded.statement_id);
+	if (state_lookup.ok()) {
+		state = state_lookup.MoveValueUnsafe();
+	} else {
+		ARROW_ASSIGN_OR_RAISE(auto fallback_entry,
+		                      CreateStatementPreparedState(decoded.query, decoded.transaction_id, decoded.statement_id));
+		state = fallback_entry.second;
 	}
-	return StreamSQL(decoded.query);
+
+	auto cleanup_statement = [this, statement_id = decoded.statement_id, transaction_id = decoded.transaction_id]() {
+		(void)RemovePreparedStatement(statement_id, false);
+		if (transaction_id.has_value()) {
+			RemoveTransactionOwnedPreparedHandle(transaction_id.value(), statement_id);
+		}
+	};
+
+	std::optional<uint64_t> owner_transaction;
+	{
+		std::shared_lock<std::shared_mutex> state_lock(state->mutex);
+		owner_transaction = state->transaction_owner;
+	}
+
+	case_insensitive_map_t<BoundParameterData> empty_parameters;
+	if (owner_transaction.has_value()) {
+		ARROW_ASSIGN_OR_RAISE(auto transaction_state, LookupTransaction(owner_transaction.value()));
+		std::unique_lock<std::shared_mutex> transaction_lock(transaction_state->mutex);
+		{
+			std::shared_lock<std::shared_mutex> state_lock(state->mutex);
+			if (!state->prepared) {
+				return Status::Invalid("Prepared statement state is not initialized");
+			}
+			if (!state->ordered_parameters.empty()) {
+				return Status::Invalid("Statement query does not support parameterized SQL");
+			}
+		}
+		auto result = state->prepared->Execute(empty_parameters, true);
+		if (!result || result->HasError()) {
+			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
+		}
+		state->UpdateActivityTime();
+		transaction_state->UpdateActivityTime();
+		ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+		return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
+		                                                std::shared_ptr<void>(transaction_state), cleanup_statement);
+	}
+
+	std::unique_lock<std::shared_mutex> state_lock(state->mutex);
+	if (!state->prepared || !state->connection) {
+		return Status::Invalid("Prepared statement state is not initialized");
+	}
+	if (!state->ordered_parameters.empty()) {
+		return Status::Invalid("Statement query does not support parameterized SQL");
+	}
+	auto result = state->prepared->Execute(empty_parameters, true);
+	if (!result || result->HasError()) {
+		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
+	}
+	state->UpdateActivityTime();
+	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(state_lock), std::shared_ptr<void>(state),
+	                                                cleanup_statement);
 }
 
 Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoPreparedStatement(
