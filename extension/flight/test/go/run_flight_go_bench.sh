@@ -11,6 +11,7 @@ ROWS=100000
 WORKERS=200
 BATCH_SIZE=1000
 CRUD_ITERS=2000
+SELECT_ITERS=2000
 KEEP_DB=0
 
 print_usage() {
@@ -25,6 +26,7 @@ Options:
   --workers N           Concurrent goroutines (default: 200)
   --batch-size N        Batch size for batch inserts (default: 1000)
   --crud-iters N        Iterations for CRUD single-op phase (default: 2000)
+  --select-iters N      Iterations for select prepare-mode phase (default: 2000)
   --keep-db             Keep temp benchmark directory/db file
   --help                Show this help
 EOF
@@ -58,6 +60,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --crud-iters)
       CRUD_ITERS="$2"
+      shift 2
+      ;;
+    --select-iters)
+      SELECT_ITERS="$2"
       shift 2
       ;;
     --keep-db)
@@ -181,5 +187,6 @@ echo "Running Go Flight SQL benchmark test..."
     -rows "${ROWS}" \
     -workers "${WORKERS}" \
     -batch-size "${BATCH_SIZE}" \
-    -crud-iters "${CRUD_ITERS}"
+    -crud-iters "${CRUD_ITERS}" \
+    -select-iters "${SELECT_ITERS}"
 )
