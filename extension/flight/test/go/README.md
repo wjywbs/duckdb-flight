@@ -42,6 +42,20 @@ The script:
 5. Prints benchmark timings and DB file size.
 6. Shuts down and removes temp files (unless `--keep-db` is set).
 
+To run the raw Flight SQL API benchmark directly (without `database/sql` wrapper):
+
+```sh
+cd extension/flight/test/go
+go test -v -count=1 -run '^TestFlightSQLBenchmarksRaw$' ./... -args \
+  -host 127.0.0.1 \
+  -port <FLIGHT_SQL_PORT> \
+  -rows 100000 \
+  -workers 200 \
+  -batch-size 1000 \
+  -crud-iters 2000 \
+  -select-iters 2000
+```
+
 ## Workload
 
 - CRUD single-operation autocommit timing
@@ -58,8 +72,8 @@ The script:
 - Ordered single-reader scan of 100k rows with correctness checks
 - Ordered concurrent shard scans with correctness checks
 - Ordered concurrent full-table scans with correctness checks (no sharding)
-
-This benchmark path is script-driven and not part of default pytest/CI runs.
+- Raw Flight SQL API end-to-end benchmark suite mirroring the above phases
+- Raw-vs-`database/sql` select-mode overhead comparison phase
 
 ## Concurrent Transaction Benchmark
 
@@ -256,3 +270,57 @@ Interpretation:
 - For the full-scan test, aggregate throughput increases with workers up to roughly `64-128`, then plateaus around `41-42M rows/s`.
 - Unlike sharded mode, full-scan mode does not collapse at high workers in aggregate throughput, but it also does not scale linearly with worker count.
 - This indicates shared bottlenecks (CPU scheduling, gRPC/Flight stream overhead, and memory bandwidth) limit scaling once concurrency is high.
+
+## Full-Suite Comparison (Wrapper vs Raw API)
+
+Setup used:
+
+- same daemon + DB file
+- `rows=100000`, `workers=200`, `batch-size=1000`, `crud-iters=2000`, `select-iters=2000`
+- wrapper run: `^TestFlightSQLBenchmarks$`
+- raw run: `^TestFlightSQLBenchmarksRaw$`
+
+`raw/sql_ratio > 1.0` means raw API was faster (higher throughput). `raw/sql_ratio < 1.0` means `database/sql` wrapper was faster.
+
+| SQL metric | SQL rate | Raw metric | Raw rate | raw/sql_ratio |
+| --- | ---: | --- | ---: | ---: |
+| `crud_create_table` | 239.04 | `raw_crud_create_table` | 361.71 | 1.513 |
+| `crud_insert_autocommit` | 1198.52 | `raw_crud_insert_autocommit` | 2030.75 | 1.694 |
+| `crud_update_autocommit` | 1123.59 | `raw_crud_update_autocommit` | 1937.66 | 1.725 |
+| `crud_select_point` | 1565.89 | `raw_crud_select_point` | 2287.65 | 1.461 |
+| `crud_delete_autocommit` | 1198.55 | `raw_crud_delete_autocommit` | 2009.87 | 1.677 |
+| `crud_drop_table` | 1506.93 | `raw_crud_drop_table` | 2447.41 | 1.624 |
+| `batch_insert_rows` | 98210.22 | `raw_batch_insert_rows` | 163027.23 | 1.660 |
+| `batch_insert_statements` | 98.21 | `raw_batch_insert_statements` | 163.03 | 1.660 |
+| `concurrent_insert_rows` | 28305.95 | `raw_concurrent_insert_rows` | 27292.01 | 0.964 |
+| `concurrent_insert_tx_prepared_ops` | 28305.95 | `raw_concurrent_insert_tx_prepared_ops` | 27292.01 | 0.964 |
+| `select_point_direct_no_prepare` | 1894.89 | `raw_select_point_direct_no_prepare` | 1954.89 | 1.032 |
+| `select_point_prepare_each_time` | 1500.76 | `raw_select_point_prepare_each_time` | 1474.93 | 0.983 |
+| `select_point_prepare_once_reuse` | 2267.63 | `raw_select_point_prepare_once_reuse` | 2367.07 | 1.044 |
+| `select_point_concurrent_direct_no_prepare` | 13143.52 | `raw_select_point_concurrent_direct_no_prepare` | 12656.14 | 0.963 |
+| `select_point_concurrent_prepare_each_time` | 8399.91 | `raw_select_point_concurrent_prepare_each_time` | 7998.12 | 0.952 |
+| `select_point_concurrent_prepare_once_reuse` | 14030.82 | `raw_select_point_concurrent_prepare_once_reuse` | 11521.98 | 0.821 |
+| `concurrent_transactions_total` | 55.15 | `raw_concurrent_transactions_total` | 51.95 | 0.942 |
+| `concurrent_transactions_committed_rows` | 13787.54 | `raw_concurrent_transactions_committed_rows` | 12986.88 | 0.942 |
+| `concurrent_transactions_rolledback_rows` | 13787.54 | `raw_concurrent_transactions_rolledback_rows` | 12986.88 | 0.942 |
+| `concurrent_tx_ddl_dml_total` | 57.28 | `raw_concurrent_tx_ddl_dml_total` | 54.92 | 0.959 |
+| `concurrent_tx_ddl_dml_inserted_rows` | 28641.26 | `raw_concurrent_tx_ddl_dml_inserted_rows` | 27459.13 | 0.959 |
+| `concurrent_tx_ddl_dml_selected_rows` | 28641.26 | `raw_concurrent_tx_ddl_dml_selected_rows` | 27459.13 | 0.959 |
+| `concurrent_tx_conflict_total` | 2089.11 | `raw_concurrent_tx_conflict_total` | 1837.14 | 0.879 |
+| `concurrent_tx_conflict_commits` | 1044.56 | `raw_concurrent_tx_conflict_commits` | 918.57 | 0.879 |
+| `concurrent_tx_conflict_failures` | 1044.56 | `raw_concurrent_tx_conflict_failures` | 918.57 | 0.879 |
+| `select_ordered_single_rows` | 6015846.70 | `raw_select_ordered_single_rows` | 9360450.06 | 1.556 |
+| `select_ordered_concurrent_rows` | 2548918.72 | `raw_select_ordered_concurrent_rows` | 1976086.27 | 0.775 |
+| `select_ordered_concurrent_full_rows` | 39293477.42 | `raw_select_ordered_concurrent_full_rows` | 44830076.65 | 1.141 |
+
+Additional raw built-in wrapper comparison (`RAW_VS_DATABASE_SQL_SELECT_OVERHEAD`) from the same run:
+
+- `compare_select_direct_no_prepare_sql_over_raw=0.996x`
+- `compare_select_prepare_each_time_sql_over_raw=1.053x`
+- `compare_select_prepare_once_reuse_sql_over_raw=1.063x`
+
+Summary:
+
+- Raw API is clearly faster for single-thread CRUD and batch insert in this run.
+- Throughput is close (within roughly +/-10%) for many concurrent phases.
+- `database/sql` wrapper is faster in several high-concurrency/transaction scenarios here, indicating wrapper overhead is not the dominant factor there.
