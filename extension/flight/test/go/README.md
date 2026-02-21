@@ -29,7 +29,8 @@ extension/flight/test/go/run_flight_go_bench.sh \
   --rows 100000 \
   --workers 200 \
   --batch-size 1000 \
-  --crud-iters 2000
+  --crud-iters 2000 \
+  --select-iters 2000
 ```
 
 The script:
@@ -46,6 +47,10 @@ The script:
 - CRUD single-operation autocommit timing
 - Batch insert of 100k rows
 - 200-goroutine concurrent insert (per-worker transaction + prepared statement)
+- Select point-query mode comparison:
+  - direct query (no explicit prepare),
+  - prepare every call,
+  - prepare once and reuse
 - Concurrent transaction commit/rollback benchmark with visibility checks
 - Concurrent transaction DDL+DML benchmark (create/drop + insert/select in one tx)
 - Concurrent transaction commit-conflict benchmark (pairwise same-row update conflicts)
@@ -68,6 +73,21 @@ Phase: `CONCURRENT_TRANSACTIONS_COMMIT_ROLLBACK`
   - committed worker rows must persist
   - rolled-back worker rows must not persist
 - Final aggregate checks validate committed row count, distinct id count, and sum.
+
+## Select Prepare-Mode Benchmark
+
+Phase: `SELECT_PREPARE_MODES`
+
+Measures point-select latency/throughput differences for:
+
+- `select_point_direct_no_prepare`: execute direct SQL each iteration (no explicit prepared stmt)
+- `select_point_prepare_each_time`: prepare + execute + close each iteration
+- `select_point_prepare_once_reuse`: prepare once, execute repeatedly
+
+Correctness checks:
+
+- each mode validates result value per selected id (`val == id * 10`)
+- all modes run the same iteration count (`--select-iters`)
 
 ## Concurrent Transaction DDL+DML Benchmark
 
@@ -131,6 +151,10 @@ From a default 100k-row run on this environment:
 - `concurrent_insert_rows`:
   - before fix (200 goroutines, autocommit row-by-row): ~35.64s (~2.81k rows/s)
   - after fix (200 goroutines, per-worker transaction + prepared statement): ~3.5-3.8s (~26k-29k rows/s)
+- `SELECT_PREPARE_MODES` (`select-iters=2000`, point lookups on `go_flight_bench`):
+  - direct/no-prepare: ~1.01s (~1989 ops/s)
+  - prepare each time: ~1.37s (~1464 ops/s)
+  - prepare once/reuse: ~0.83s (~2419 ops/s)
 - `concurrent_transactions_total` (200 workers mixed commit/rollback): ~3.71s for 200 tx (~54 tx/s)
   - committed rows: `50000`
   - rolled-back rows: `50000`
