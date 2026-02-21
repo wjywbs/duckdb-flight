@@ -1165,6 +1165,130 @@ func runSelectPrepareModes(t *testing.T, db *sql.DB, rows, iters int) {
 	printOpMetric("select_point_prepare_once_reuse", prepareReuseDuration, int64(iters))
 }
 
+func runConcurrentSelectMode(t *testing.T, db *sql.DB, rows, workers, iters int, metricName string,
+	runWorker func(context.Context, *sql.Conn, int, int) error) {
+	t.Helper()
+	requirePositiveFlag(t, rows, "rows")
+	requirePositiveFlag(t, workers, "workers")
+	requirePositiveFlag(t, iters, "select-iters")
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	start := time.Now()
+
+	for worker := 0; worker < workers; worker++ {
+		startIter := (worker * iters) / workers
+		endIter := ((worker + 1) * iters) / workers
+		if endIter <= startIter {
+			continue
+		}
+
+		wg.Add(1)
+		go func(workerID, begin, end int) {
+			defer wg.Done()
+			ctx := context.Background()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("worker=%d acquire conn failed: %w", workerID, err)
+				return
+			}
+			defer conn.Close()
+
+			if err := runWorker(ctx, conn, begin, end); err != nil {
+				errCh <- fmt.Errorf("worker=%d %s failed: %w", workerID, metricName, err)
+				return
+			}
+		}(worker, startIter, endIter)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent select mode failed: %v", err)
+		}
+	}
+
+	duration := time.Since(start)
+	printOpMetric(metricName, duration, int64(iters))
+}
+
+func runSelectPrepareModesConcurrent(t *testing.T, db *sql.DB, rows, workers, iters int) {
+	t.Helper()
+	requirePositiveFlag(t, rows, "rows")
+	requirePositiveFlag(t, workers, "workers")
+	requirePositiveFlag(t, iters, "select-iters")
+
+	printPhaseStart("SELECT_PREPARE_MODES_CONCURRENT")
+
+	runConcurrentSelectMode(t, db, rows, workers, iters, "select_point_concurrent_direct_no_prepare",
+		func(ctx context.Context, conn *sql.Conn, begin, end int) error {
+			for i := begin; i < end; i++ {
+				id := int64(i%rows) + 1
+				query := fmt.Sprintf("SELECT val FROM %s WHERE id = %d", benchmarkTable, id)
+				var got int64
+				if err := conn.QueryRowContext(ctx, query).Scan(&got); err != nil {
+					return fmt.Errorf("iter=%d id=%d query failed: %w", i, id, err)
+				}
+				expected := expectedVal(id)
+				if got != expected {
+					return fmt.Errorf("iter=%d id=%d mismatch: got=%d expected=%d", i, id, got, expected)
+				}
+			}
+			return nil
+		},
+	)
+
+	runConcurrentSelectMode(t, db, rows, workers, iters, "select_point_concurrent_prepare_each_time",
+		func(ctx context.Context, conn *sql.Conn, begin, end int) error {
+			for i := begin; i < end; i++ {
+				id := int64(i%rows) + 1
+				stmt, err := conn.PrepareContext(ctx, "SELECT val FROM "+benchmarkTable+" WHERE id = ?")
+				if err != nil {
+					return fmt.Errorf("iter=%d prepare failed: %w", i, err)
+				}
+				var got int64
+				queryErr := stmt.QueryRowContext(ctx, id).Scan(&got)
+				closeErr := stmt.Close()
+				if queryErr != nil {
+					return fmt.Errorf("iter=%d id=%d query failed: %w", i, id, queryErr)
+				}
+				if closeErr != nil {
+					return fmt.Errorf("iter=%d close failed: %w", i, closeErr)
+				}
+				expected := expectedVal(id)
+				if got != expected {
+					return fmt.Errorf("iter=%d id=%d mismatch: got=%d expected=%d", i, id, got, expected)
+				}
+			}
+			return nil
+		},
+	)
+
+	runConcurrentSelectMode(t, db, rows, workers, iters, "select_point_concurrent_prepare_once_reuse",
+		func(ctx context.Context, conn *sql.Conn, begin, end int) error {
+			stmt, err := conn.PrepareContext(ctx, "SELECT val FROM "+benchmarkTable+" WHERE id = ?")
+			if err != nil {
+				return fmt.Errorf("prepare once failed: %w", err)
+			}
+			defer stmt.Close()
+
+			for i := begin; i < end; i++ {
+				id := int64(i%rows) + 1
+				var got int64
+				if err := stmt.QueryRowContext(ctx, id).Scan(&got); err != nil {
+					return fmt.Errorf("iter=%d id=%d query failed: %w", i, id, err)
+				}
+				expected := expectedVal(id)
+				if got != expected {
+					return fmt.Errorf("iter=%d id=%d mismatch: got=%d expected=%d", i, id, got, expected)
+				}
+			}
+			return nil
+		},
+	)
+}
+
 func runOrderedSingleRead(t *testing.T, db *sql.DB, rows int) {
 	t.Helper()
 	requirePositiveFlag(t, rows, "rows")
@@ -1383,6 +1507,7 @@ func TestFlightSQLBenchmarks(t *testing.T) {
 	runBatchInsert(t, db, *flagRows, *flagBatchSize)
 	runConcurrentInsert(t, db, *flagRows, *flagWorkers)
 	runSelectPrepareModes(t, db, *flagRows, *flagSelectIters)
+	runSelectPrepareModesConcurrent(t, db, *flagRows, *flagWorkers, *flagSelectIters)
 	runConcurrentTransactionCommitRollback(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCreateDropInsertSelect(t, db, *flagRows, *flagWorkers)
 	runConcurrentTransactionCommitConflicts(t, db, *flagWorkers)

@@ -51,6 +51,7 @@ The script:
   - direct query (no explicit prepare),
   - prepare every call,
   - prepare once and reuse
+- Concurrent select point-query mode comparison (same 3 modes, across workers)
 - Concurrent transaction commit/rollback benchmark with visibility checks
 - Concurrent transaction DDL+DML benchmark (create/drop + insert/select in one tx)
 - Concurrent transaction commit-conflict benchmark (pairwise same-row update conflicts)
@@ -88,6 +89,22 @@ Correctness checks:
 
 - each mode validates result value per selected id (`val == id * 10`)
 - all modes run the same iteration count (`--select-iters`)
+
+## Concurrent Select Prepare-Mode Benchmark
+
+Phase: `SELECT_PREPARE_MODES_CONCURRENT`
+
+Measures the same point-select modes as `SELECT_PREPARE_MODES`, but with worker concurrency:
+
+- `select_point_concurrent_direct_no_prepare`
+- `select_point_concurrent_prepare_each_time`
+- `select_point_concurrent_prepare_once_reuse`
+
+Notes:
+
+- total ops are still `--select-iters` (distributed across workers)
+- each worker gets its own `database/sql` connection
+- correctness validation is identical (`val == id * 10`)
 
 ## Concurrent Transaction DDL+DML Benchmark
 
@@ -152,9 +169,13 @@ From a default 100k-row run on this environment:
   - before fix (200 goroutines, autocommit row-by-row): ~35.64s (~2.81k rows/s)
   - after fix (200 goroutines, per-worker transaction + prepared statement): ~3.5-3.8s (~26k-29k rows/s)
 - `SELECT_PREPARE_MODES` (`select-iters=2000`, point lookups on `go_flight_bench`):
-  - direct/no-prepare: ~1.01s (~1989 ops/s)
-  - prepare each time: ~1.37s (~1464 ops/s)
-  - prepare once/reuse: ~0.83s (~2419 ops/s)
+  - direct/no-prepare: ~1.10s (~1813 ops/s)
+  - prepare each time: ~1.33s (~1509 ops/s)
+  - prepare once/reuse: ~0.81s (~2463 ops/s)
+- `SELECT_PREPARE_MODES_CONCURRENT` (`workers=200`, `select-iters=2000`):
+  - concurrent direct/no-prepare: ~145ms (~13.8k ops/s)
+  - concurrent prepare each time: ~203ms (~9.83k ops/s)
+  - concurrent prepare once/reuse: ~134ms (~14.9k ops/s)
 - `concurrent_transactions_total` (200 workers mixed commit/rollback): ~3.71s for 200 tx (~54 tx/s)
   - committed rows: `50000`
   - rolled-back rows: `50000`
