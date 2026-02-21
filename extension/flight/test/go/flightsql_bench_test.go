@@ -3,6 +3,7 @@ package goflightbench
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -208,6 +209,20 @@ func toInt64(value any, fieldName string) (int64, error) {
 	default:
 		return 0, fmt.Errorf("unsupported %s type %T", fieldName, value)
 	}
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "deadline exceeded") ||
+		strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "timed out") ||
+		strings.Contains(text, "timeout")
 }
 
 func buildBatchInsertSQL(startID int64, size int) (string, []any) {
@@ -1490,6 +1505,32 @@ func TestPing(t *testing.T) {
 	}
 	if got != 1 {
 		t.Fatalf("unexpected ping result: got=%d expected=1", got)
+	}
+}
+
+func TestQueryTimeoutDatabaseSQL(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+
+	// Use a genuinely long-running query so timeout behavior is exercised on active execution.
+	longRunningQuery := "SELECT COUNT(*)::BIGINT FROM range(300000000) t(i) WHERE hash(i) % 2 = 0"
+	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelTimeout()
+	var timedOutCount int64
+	if err := db.QueryRowContext(timeoutCtx, longRunningQuery).Scan(&timedOutCount); err == nil {
+		t.Fatalf("expected timeout/deadline error for long-running QueryRowContext")
+	} else if !isTimeoutErr(err) {
+		t.Fatalf("expected timeout/deadline error, got: %v", err)
+	}
+
+	successCtx, cancelSuccess := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSuccess()
+	var got int
+	if err := db.QueryRowContext(successCtx, "SELECT 1").Scan(&got); err != nil {
+		t.Fatalf("control QueryRowContext failed: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("unexpected control query result: got=%d expected=1", got)
 	}
 }
 
