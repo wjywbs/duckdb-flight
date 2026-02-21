@@ -308,37 +308,37 @@ Setup used:
 
 | SQL metric | SQL rate | Raw metric | Raw rate | raw/sql_ratio |
 | --- | ---: | --- | ---: | ---: |
-| `crud_create_table` | 239.04 | `raw_crud_create_table` | 361.71 | 1.513 |
-| `crud_insert_autocommit` | 1198.52 | `raw_crud_insert_autocommit` | 2030.75 | 1.694 |
-| `crud_update_autocommit` | 1123.59 | `raw_crud_update_autocommit` | 1937.66 | 1.725 |
-| `crud_select_point` | 1565.89 | `raw_crud_select_point` | 2287.65 | 1.461 |
-| `crud_delete_autocommit` | 1198.55 | `raw_crud_delete_autocommit` | 2009.87 | 1.677 |
-| `crud_drop_table` | 1506.93 | `raw_crud_drop_table` | 2447.41 | 1.624 |
-| `batch_insert_rows` | 98210.22 | `raw_batch_insert_rows` | 163027.23 | 1.660 |
-| `batch_insert_statements` | 98.21 | `raw_batch_insert_statements` | 163.03 | 1.660 |
-| `concurrent_insert_rows` | 28305.95 | `raw_concurrent_insert_rows` | 27292.01 | 0.964 |
-| `concurrent_insert_tx_prepared_ops` | 28305.95 | `raw_concurrent_insert_tx_prepared_ops` | 27292.01 | 0.964 |
-| `select_point_direct_no_prepare` | 1894.89 | `raw_select_point_direct_no_prepare` | 1954.89 | 1.032 |
-| `select_point_prepare_each_time` | 1500.76 | `raw_select_point_prepare_each_time` | 1474.93 | 0.983 |
-| `select_point_prepare_once_reuse` | 2267.63 | `raw_select_point_prepare_once_reuse` | 2367.07 | 1.044 |
-| `select_point_concurrent_direct_no_prepare` | 13143.52 | `raw_select_point_concurrent_direct_no_prepare` | 12656.14 | 0.963 |
-| `select_point_concurrent_prepare_each_time` | 8399.91 | `raw_select_point_concurrent_prepare_each_time` | 7998.12 | 0.952 |
-| `select_point_concurrent_prepare_once_reuse` | 14030.82 | `raw_select_point_concurrent_prepare_once_reuse` | 11521.98 | 0.821 |
-| `concurrent_transactions_total` | 55.15 | `raw_concurrent_transactions_total` | 51.95 | 0.942 |
-| `concurrent_transactions_committed_rows` | 13787.54 | `raw_concurrent_transactions_committed_rows` | 12986.88 | 0.942 |
-| `concurrent_transactions_rolledback_rows` | 13787.54 | `raw_concurrent_transactions_rolledback_rows` | 12986.88 | 0.942 |
-| `concurrent_tx_ddl_dml_total` | 57.28 | `raw_concurrent_tx_ddl_dml_total` | 54.92 | 0.959 |
-| `concurrent_tx_ddl_dml_inserted_rows` | 28641.26 | `raw_concurrent_tx_ddl_dml_inserted_rows` | 27459.13 | 0.959 |
-| `concurrent_tx_ddl_dml_selected_rows` | 28641.26 | `raw_concurrent_tx_ddl_dml_selected_rows` | 27459.13 | 0.959 |
-| `concurrent_tx_conflict_total` | 2089.11 | `raw_concurrent_tx_conflict_total` | 1837.14 | 0.879 |
-| `concurrent_tx_conflict_commits` | 1044.56 | `raw_concurrent_tx_conflict_commits` | 918.57 | 0.879 |
-| `concurrent_tx_conflict_failures` | 1044.56 | `raw_concurrent_tx_conflict_failures` | 918.57 | 0.879 |
-| `select_ordered_single_rows` | 6015846.70 | `raw_select_ordered_single_rows` | 9360450.06 | 1.556 |
-| `select_ordered_concurrent_rows` | 2548918.72 | `raw_select_ordered_concurrent_rows` | 1976086.27 | 0.775 |
-| `select_ordered_concurrent_full_rows` | 39293477.42 | `raw_select_ordered_concurrent_full_rows` | 44830076.65 | 1.141 |
+| `crud_create_table` | 187.68 | `raw_crud_create_table` | 779.32 | 4.152 |
+| `crud_insert_autocommit` | 1166.89 | `raw_crud_insert_autocommit` | 2077.13 | 1.780 |
+| `crud_update_autocommit` | 1085.01 | `raw_crud_update_autocommit` | 1995.42 | 1.839 |
+| `crud_select_point` | 1505.86 | `raw_crud_select_point` | 3075.23 | 2.042 |
+| `crud_delete_autocommit` | 1157.48 | `raw_crud_delete_autocommit` | 1995.45 | 1.724 |
+| `crud_drop_table` | 1570.27 | `raw_crud_drop_table` | 2430.87 | 1.548 |
+| `batch_insert_rows` | 107298.48 | `raw_batch_insert_rows` | 167075.32 | 1.557 |
+| `batch_insert_statements` | 107.30 | `raw_batch_insert_statements` | 167.08 | 1.557 |
+| `concurrent_insert_rows` | 28141.28 | `raw_concurrent_insert_rows` | 28582.21 | 1.016 |
+| `concurrent_insert_tx_prepared_ops` | 28141.28 | `raw_concurrent_insert_tx_prepared_ops` | 28582.21 | 1.016 |
+| `select_point_direct_no_prepare` | 2517.44 | `raw_select_point_direct_no_prepare` | 2610.61 | 1.037 |
+| `select_point_prepare_each_time` | 1471.39 | `raw_select_point_prepare_each_time` | 1521.25 | 1.034 |
+| `select_point_prepare_once_reuse` | 2279.16 | `raw_select_point_prepare_once_reuse` | 2314.59 | 1.016 |
+| `select_point_concurrent_direct_no_prepare` | 15698.58 | `raw_select_point_concurrent_direct_no_prepare` | 14447.89 | 0.920 |
+| `select_point_concurrent_prepare_each_time` | 9074.90 | `raw_select_point_concurrent_prepare_each_time` | 8280.21 | 0.912 |
+| `select_point_concurrent_prepare_once_reuse` | 13533.26 | `raw_select_point_concurrent_prepare_once_reuse` | 13541.42 | 1.001 |
+| `concurrent_transactions_total` | 56.72 | `raw_concurrent_transactions_total` | 53.22 | 0.938 |
+| `concurrent_transactions_committed_rows` | 14180.08 | `raw_concurrent_transactions_committed_rows` | 13303.78 | 0.938 |
+| `concurrent_transactions_rolledback_rows` | 14180.08 | `raw_concurrent_transactions_rolledback_rows` | 13303.78 | 0.938 |
+| `concurrent_tx_ddl_dml_total` | 58.19 | `raw_concurrent_tx_ddl_dml_total` | 55.93 | 0.961 |
+| `concurrent_tx_ddl_dml_inserted_rows` | 29093.13 | `raw_concurrent_tx_ddl_dml_inserted_rows` | 27965.16 | 0.961 |
+| `concurrent_tx_ddl_dml_selected_rows` | 29093.13 | `raw_concurrent_tx_ddl_dml_selected_rows` | 27965.16 | 0.961 |
+| `concurrent_tx_conflict_total` | 2095.05 | `raw_concurrent_tx_conflict_total` | 2171.76 | 1.037 |
+| `concurrent_tx_conflict_commits` | 1047.53 | `raw_concurrent_tx_conflict_commits` | 1085.88 | 1.037 |
+| `concurrent_tx_conflict_failures` | 1047.53 | `raw_concurrent_tx_conflict_failures` | 1085.88 | 1.037 |
+| `select_ordered_single_rows` | 7143307.17 | `raw_select_ordered_single_rows` | 14070395.03 | 1.970 |
+| `select_ordered_concurrent_rows` | 2638326.61 | `raw_select_ordered_concurrent_rows` | 3009043.68 | 1.141 |
+| `select_ordered_concurrent_full_rows` | 50252692.52 | `raw_select_ordered_concurrent_full_rows` | 53198967.92 | 1.059 |
 
 Summary:
 
-- Raw API is clearly faster for single-thread CRUD and batch insert in this run.
-- Throughput is close (within roughly +/-10%) for many concurrent phases.
-- `database/sql` wrapper is faster in several high-concurrency/transaction scenarios here, indicating wrapper overhead is not the dominant factor there.
+- Raw API is clearly faster for single-thread CRUD, batch insert, and ordered-read phases in this run.
+- Raw API is also slightly faster for concurrent insert and conflict benchmark here.
+- `database/sql` remains faster on concurrent transaction commit/rollback + DDL/DML phases, and on two of the three concurrent point-select modes.
