@@ -186,35 +186,49 @@ Correctness checks:
 
 ## Latest Results (Analysis)
 
-From a default 100k-row run on this environment:
+From a default run on this environment (`rows=100000`, `workers=200`, `batch-size=1000`, `crud-iters=2000`, `select-iters=2000`) after the `GetFlightInfoStatement` single-execution fix:
 
-- `batch_insert_rows`: ~0.94-0.98s (~102k-106k rows/s)
+- `batch_insert_rows`: `953ms` (`104887 rows/s`)
 - `concurrent_insert_rows`:
   - before fix (200 goroutines, autocommit row-by-row): ~35.64s (~2.81k rows/s)
-  - after fix (200 goroutines, per-worker transaction + prepared statement): ~3.5-3.8s (~26k-29k rows/s)
+  - after insert-path fix (200 goroutines, per-worker transaction + prepared statement): `3.44s` (`29087 rows/s`)
 - `SELECT_PREPARE_MODES` (`select-iters=2000`, point lookups on `go_flight_bench`):
-  - direct/no-prepare: ~1.10s (~1813 ops/s)
-  - prepare each time: ~1.33s (~1509 ops/s)
-  - prepare once/reuse: ~0.81s (~2463 ops/s)
+  - direct/no-prepare: `806ms` (`2482 ops/s`)
+  - prepare each time: `1.40s` (`1429 ops/s`)
+  - prepare once/reuse: `842ms` (`2375 ops/s`)
 - `SELECT_PREPARE_MODES_CONCURRENT` (`workers=200`, `select-iters=2000`):
-  - concurrent direct/no-prepare: ~145ms (~13.8k ops/s)
-  - concurrent prepare each time: ~203ms (~9.83k ops/s)
-  - concurrent prepare once/reuse: ~134ms (~14.9k ops/s)
-- `concurrent_transactions_total` (200 workers mixed commit/rollback): ~3.71s for 200 tx (~54 tx/s)
+  - concurrent direct/no-prepare: `120ms` (`16642 ops/s`)
+  - concurrent prepare each time: `210ms` (`9509 ops/s`)
+  - concurrent prepare once/reuse: `142ms` (`14107 ops/s`)
+- `concurrent_transactions_total` (200 workers mixed commit/rollback): `3.56s` for 200 tx (`56.2 tx/s`)
   - committed rows: `50000`
   - rolled-back rows: `50000`
-- `concurrent_tx_ddl_dml_total` (200 workers, create/drop + insert/select): ~3.30s for 200 tx (~60.6 tx/s)
+- `concurrent_tx_ddl_dml_total` (200 workers, create/drop + insert/select): `3.54s` for 200 tx (`56.6 tx/s`)
   - inserted rows: `100000`
   - selected rows: `100000`
-- `concurrent_tx_conflict_total` (pairwise conflicts, 200 workers => 400 tx): ~0.20s for 400 tx (~2005 tx/s)
+- `concurrent_tx_conflict_total` (pairwise conflicts, 200 workers => 400 tx): `181ms` for 400 tx (`2212 tx/s`)
   - commits: `200`
   - conflict failures: `200`
-- `select_ordered_single_rows`: ~18-19ms
-- `select_ordered_concurrent_rows`: ~40-46ms
+- `select_ordered_single_rows`: `13.8ms` (`7.22M rows/s`)
+- `select_ordered_concurrent_rows`: `38.9ms` (`2.57M rows/s`)
+- `select_ordered_concurrent_full_rows`: `430ms` (`46.5M rows/s` aggregate)
+
+`GetFlightInfoStatement` fix impact (using the previous baseline in this README vs this latest run):
+
+| Metric | Previous ops/s | Latest ops/s | Change |
+| --- | ---: | ---: | ---: |
+| `select_point_direct_no_prepare` | 1813 | 2482 | +36.9% |
+| `select_point_prepare_each_time` | 1509 | 1429 | -5.3% |
+| `select_point_prepare_once_reuse` | 2463 | 2375 | -3.6% |
+| `select_point_concurrent_direct_no_prepare` | 13800 | 16642 | +20.6% |
+| `select_point_concurrent_prepare_each_time` | 9830 | 9509 | -3.3% |
+| `select_point_concurrent_prepare_once_reuse` | 14900 | 14107 | -5.3% |
 
 Concise conclusion:
 
-- The slow path was not Flight transport startup overhead; it was write-commit pressure from many tiny autocommit writes.
+- The `GetFlightInfoStatement` single-execution fix materially improved the direct/no-prepare query path.
+- Direct/no-prepare is now the fastest select mode in this run (single and concurrent), which matches the expectation after removing duplicate execution.
+- The main insert bottleneck conclusion is unchanged: autocommit row-by-row is still the slow path under high concurrency.
 - With 200 goroutines, autocommit row-by-row causes high commit and writer-lock contention in a file-backed DB.
 - Grouping each worker's inserts into one transaction and reusing a prepared statement reduced commit frequency and improved concurrent insert throughput by about 10x in this setup.
 
