@@ -2,7 +2,6 @@ package goflightbench
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"math"
 	"strconv"
@@ -1623,171 +1622,6 @@ func runRawOrderedConcurrentFullRead(t *testing.T, rows, workers int) {
 	printRowMetric("raw_select_ordered_concurrent_full_rows", duration, total)
 }
 
-type selectModeDurations struct {
-	direct       time.Duration
-	prepareEach  time.Duration
-	prepareReuse time.Duration
-}
-
-func measureSelectModesDatabaseSQL(t *testing.T, db *sql.DB, rows, iters int) selectModeDurations {
-	t.Helper()
-	ctx := context.Background()
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("sql compare acquire conn failed: %v", err)
-	}
-	defer conn.Close()
-
-	selectSQL := "SELECT val FROM " + benchmarkTable + " WHERE id = ?"
-	var out selectModeDurations
-
-	start := time.Now()
-	for i := 0; i < iters; i++ {
-		id := int64(i%rows) + 1
-		query := fmt.Sprintf("SELECT val FROM %s WHERE id = %d", benchmarkTable, id)
-		var got int64
-		if err := conn.QueryRowContext(ctx, query).Scan(&got); err != nil {
-			t.Fatalf("sql compare direct failed at iter=%d id=%d: %v", i, id, err)
-		}
-		if got != expectedVal(id) {
-			t.Fatalf("sql compare direct mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expectedVal(id))
-		}
-	}
-	out.direct = time.Since(start)
-
-	start = time.Now()
-	for i := 0; i < iters; i++ {
-		id := int64(i%rows) + 1
-		stmt, err := conn.PrepareContext(ctx, selectSQL)
-		if err != nil {
-			t.Fatalf("sql compare prepare-each prepare failed at iter=%d: %v", i, err)
-		}
-		var got int64
-		queryErr := stmt.QueryRowContext(ctx, id).Scan(&got)
-		closeErr := stmt.Close()
-		if queryErr != nil {
-			t.Fatalf("sql compare prepare-each query failed at iter=%d id=%d: %v", i, id, queryErr)
-		}
-		if closeErr != nil {
-			t.Fatalf("sql compare prepare-each close failed at iter=%d: %v", i, closeErr)
-		}
-		if got != expectedVal(id) {
-			t.Fatalf("sql compare prepare-each mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expectedVal(id))
-		}
-	}
-	out.prepareEach = time.Since(start)
-
-	stmt, err := conn.PrepareContext(ctx, selectSQL)
-	if err != nil {
-		t.Fatalf("sql compare prepare-once prepare failed: %v", err)
-	}
-	start = time.Now()
-	for i := 0; i < iters; i++ {
-		id := int64(i%rows) + 1
-		var got int64
-		if err := stmt.QueryRowContext(ctx, id).Scan(&got); err != nil {
-			_ = stmt.Close()
-			t.Fatalf("sql compare prepare-once query failed at iter=%d id=%d: %v", i, id, err)
-		}
-		if got != expectedVal(id) {
-			_ = stmt.Close()
-			t.Fatalf("sql compare prepare-once mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expectedVal(id))
-		}
-	}
-	out.prepareReuse = time.Since(start)
-	if err := stmt.Close(); err != nil {
-		t.Fatalf("sql compare prepare-once close failed: %v", err)
-	}
-	return out
-}
-
-func measureSelectModesRaw(t *testing.T, client *flightsql.Client, rows, iters int) selectModeDurations {
-	t.Helper()
-	ctx := context.Background()
-	var out selectModeDurations
-
-	start := time.Now()
-	for i := 0; i < iters; i++ {
-		id := int64(i%rows) + 1
-		got, err := rawQueryInt64(ctx, client, fmt.Sprintf("SELECT val FROM %s WHERE id = %d", benchmarkTable, id))
-		if err != nil {
-			t.Fatalf("raw compare direct failed at iter=%d id=%d: %v", i, id, err)
-		}
-		if got != expectedVal(id) {
-			t.Fatalf("raw compare direct mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expectedVal(id))
-		}
-	}
-	out.direct = time.Since(start)
-
-	start = time.Now()
-	for i := 0; i < iters; i++ {
-		id := int64(i%rows) + 1
-		stmt, err := client.Prepare(ctx, "SELECT val FROM "+benchmarkTable+" WHERE id = ?")
-		if err != nil {
-			t.Fatalf("raw compare prepare-each prepare failed at iter=%d: %v", i, err)
-		}
-		got, execErr := rawExecutePreparedQueryInt64(ctx, client, stmt, [][]any{{id}})
-		closeErr := stmt.Close(ctx)
-		if execErr != nil {
-			t.Fatalf("raw compare prepare-each query failed at iter=%d id=%d: %v", i, id, execErr)
-		}
-		if closeErr != nil {
-			t.Fatalf("raw compare prepare-each close failed at iter=%d: %v", i, closeErr)
-		}
-		if got != expectedVal(id) {
-			t.Fatalf("raw compare prepare-each mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expectedVal(id))
-		}
-	}
-	out.prepareEach = time.Since(start)
-
-	stmt, err := client.Prepare(ctx, "SELECT val FROM "+benchmarkTable+" WHERE id = ?")
-	if err != nil {
-		t.Fatalf("raw compare prepare-once prepare failed: %v", err)
-	}
-	start = time.Now()
-	for i := 0; i < iters; i++ {
-		id := int64(i%rows) + 1
-		got, err := rawExecutePreparedQueryInt64(ctx, client, stmt, [][]any{{id}})
-		if err != nil {
-			_ = stmt.Close(ctx)
-			t.Fatalf("raw compare prepare-once query failed at iter=%d id=%d: %v", i, id, err)
-		}
-		if got != expectedVal(id) {
-			_ = stmt.Close(ctx)
-			t.Fatalf("raw compare prepare-once mismatch at iter=%d id=%d: got=%d expected=%d", i, id, got, expectedVal(id))
-		}
-	}
-	out.prepareReuse = time.Since(start)
-	if err := stmt.Close(ctx); err != nil {
-		t.Fatalf("raw compare prepare-once close failed: %v", err)
-	}
-	return out
-}
-
-func printModeComparison(name string, sqlDur, rawDur time.Duration, ops int64) {
-	printOpMetric("compare_sql_"+name, sqlDur, ops)
-	printOpMetric("compare_raw_"+name, rawDur, ops)
-	if rawDur > 0 {
-		fmt.Printf("compare_%s_sql_over_raw=%.3fx\n", name, float64(sqlDur)/float64(rawDur))
-	}
-}
-
-func runRawVsDatabaseSQLSelectOverhead(t *testing.T, rawClient *flightsql.Client, rows, iters int) {
-	t.Helper()
-	requirePositiveFlag(t, rows, "rows")
-	requirePositiveFlag(t, iters, "select-iters")
-
-	printPhaseStart("RAW_VS_DATABASE_SQL_SELECT_OVERHEAD")
-	db := openDB(t)
-	defer db.Close()
-
-	sqlDur := measureSelectModesDatabaseSQL(t, db, rows, iters)
-	rawDur := measureSelectModesRaw(t, rawClient, rows, iters)
-	printModeComparison("select_direct_no_prepare", sqlDur.direct, rawDur.direct, int64(iters))
-	printModeComparison("select_prepare_each_time", sqlDur.prepareEach, rawDur.prepareEach, int64(iters))
-	printModeComparison("select_prepare_once_reuse", sqlDur.prepareReuse, rawDur.prepareReuse, int64(iters))
-}
-
 func TestPingRaw(t *testing.T) {
 	client := openRawClient(t)
 	defer client.Close()
@@ -1813,7 +1647,6 @@ func TestFlightSQLBenchmarksRaw(t *testing.T) {
 
 	runRawCrudSingleOpAutocommit(t, client, *flagCrudIters)
 	runRawBatchInsert(t, client, *flagRows, *flagBatchSize)
-	runRawVsDatabaseSQLSelectOverhead(t, client, *flagRows, *flagSelectIters)
 	runRawConcurrentInsert(t, client, *flagRows, *flagWorkers)
 	runRawSelectPrepareModes(t, client, *flagRows, *flagSelectIters)
 	runRawSelectPrepareModesConcurrent(t, *flagRows, *flagWorkers, *flagSelectIters)
