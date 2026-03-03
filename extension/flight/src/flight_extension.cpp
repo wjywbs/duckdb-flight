@@ -82,7 +82,7 @@ static unique_ptr<FunctionData> StartWithPortBind(ClientContext &, TableFunction
 	types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	if (input.inputs.empty()) {
-		throw InvalidInputException("start_flight_sql_server(port) requires a port argument");
+		throw InvalidInputException("flight_sql_start_server(port) requires a port argument");
 	}
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Flight SQL port cannot be NULL");
@@ -96,7 +96,7 @@ static unique_ptr<FunctionData> SetTransactionTimeoutBind(ClientContext &, Table
 	types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	if (input.inputs.empty()) {
-		throw InvalidInputException("set_flight_sql_transaction_timeout_seconds(seconds) requires an argument");
+		throw InvalidInputException("flight_sql_set_transaction_timeout_seconds(seconds) requires an argument");
 	}
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Transaction timeout cannot be NULL");
@@ -113,7 +113,7 @@ static unique_ptr<FunctionData> SetPreparedTimeoutBind(ClientContext &, TableFun
 	types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	if (input.inputs.empty()) {
-		throw InvalidInputException("set_flight_sql_prepared_timeout_seconds(seconds) requires an argument");
+		throw InvalidInputException("flight_sql_set_prepared_timeout_seconds(seconds) requires an argument");
 	}
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Prepared statement timeout cannot be NULL");
@@ -130,7 +130,7 @@ static unique_ptr<FunctionData> SetSweeperIntervalBind(ClientContext &, TableFun
 	types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	if (input.inputs.empty()) {
-		throw InvalidInputException("set_flight_sql_sweeper_interval_seconds(seconds) requires an argument");
+		throw InvalidInputException("flight_sql_set_sweeper_interval_seconds(seconds) requires an argument");
 	}
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Sweeper interval cannot be NULL");
@@ -237,45 +237,45 @@ static void GetSweeperIntervalFunction(ClientContext & /*context*/, TableFunctio
 
 static void RegisterFunctions(ExtensionLoader &loader) {
 	auto start_no_arg =
-	    TableFunction("start_flight_sql_server", {}, StartFlightSQLServerFunction, StartNoArgBind, RunOnceState::Init);
+	    TableFunction("flight_sql_start_server", {}, StartFlightSQLServerFunction, StartNoArgBind, RunOnceState::Init);
 	loader.RegisterFunction(start_no_arg);
 
-	auto start_with_port = TableFunction("start_flight_sql_server", {LogicalType::USMALLINT}, StartFlightSQLServerFunction,
+	auto start_with_port = TableFunction("flight_sql_start_server", {LogicalType::USMALLINT}, StartFlightSQLServerFunction,
 	                                     StartWithPortBind, RunOnceState::Init);
 	loader.RegisterFunction(start_with_port);
 
 	auto stop =
-	    TableFunction("stop_flight_sql_server", {}, StopFlightSQLServerFunction, StringResultBind, RunOnceState::Init);
+	    TableFunction("flight_sql_stop_server", {}, StopFlightSQLServerFunction, StringResultBind, RunOnceState::Init);
 	loader.RegisterFunction(stop);
 
 	auto started =
 	    TableFunction("flight_sql_is_started", {}, FlightSQLIsStartedFunction, BoolResultBind, RunOnceState::Init);
 	loader.RegisterFunction(started);
 
-	auto url = TableFunction("get_flight_sql_url", {}, GetFlightSQLURLFunction, StringResultBind, RunOnceState::Init);
+	auto url = TableFunction("flight_sql_get_url", {}, GetFlightSQLURLFunction, StringResultBind, RunOnceState::Init);
 	loader.RegisterFunction(url);
 
-	auto set_timeout = TableFunction("set_flight_sql_transaction_timeout_seconds", {LogicalType::BIGINT},
+	auto set_timeout = TableFunction("flight_sql_set_transaction_timeout_seconds", {LogicalType::BIGINT},
 	                                 SetTransactionTimeoutFunction, SetTransactionTimeoutBind, RunOnceState::Init);
 	loader.RegisterFunction(set_timeout);
 
-	auto get_timeout = TableFunction("get_flight_sql_transaction_timeout_seconds", {}, GetTransactionTimeoutFunction,
+	auto get_timeout = TableFunction("flight_sql_get_transaction_timeout_seconds", {}, GetTransactionTimeoutFunction,
 	                                 BigIntResultBind, RunOnceState::Init);
 	loader.RegisterFunction(get_timeout);
 
-	auto set_prepared_timeout = TableFunction("set_flight_sql_prepared_timeout_seconds", {LogicalType::BIGINT},
+	auto set_prepared_timeout = TableFunction("flight_sql_set_prepared_timeout_seconds", {LogicalType::BIGINT},
 	                                          SetPreparedTimeoutFunction, SetPreparedTimeoutBind, RunOnceState::Init);
 	loader.RegisterFunction(set_prepared_timeout);
 
-	auto get_prepared_timeout = TableFunction("get_flight_sql_prepared_timeout_seconds", {}, GetPreparedTimeoutFunction,
+	auto get_prepared_timeout = TableFunction("flight_sql_get_prepared_timeout_seconds", {}, GetPreparedTimeoutFunction,
 	                                          BigIntResultBind, RunOnceState::Init);
 	loader.RegisterFunction(get_prepared_timeout);
 
-	auto set_sweeper_interval = TableFunction("set_flight_sql_sweeper_interval_seconds", {LogicalType::BIGINT},
+	auto set_sweeper_interval = TableFunction("flight_sql_set_sweeper_interval_seconds", {LogicalType::BIGINT},
 	                                          SetSweeperIntervalFunction, SetSweeperIntervalBind, RunOnceState::Init);
 	loader.RegisterFunction(set_sweeper_interval);
 
-	auto get_sweeper_interval = TableFunction("get_flight_sql_sweeper_interval_seconds", {}, GetSweeperIntervalFunction,
+	auto get_sweeper_interval = TableFunction("flight_sql_get_sweeper_interval_seconds", {}, GetSweeperIntervalFunction,
 	                                          BigIntResultBind, RunOnceState::Init);
 	loader.RegisterFunction(get_sweeper_interval);
 }

@@ -5219,7 +5219,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv) {
 			auto extension_path = fallback_flight_extension_path(argv[0]);
 			if (!extension_path.empty() && access(extension_path.c_str(), 0) == 0) {
 				auto fallback_cmd = duckdb::StringUtil::Format(
-				    "LOAD '%s'; CALL start_flight_sql_server(CAST(%d AS USMALLINT))", sql_escape_literal(extension_path),
+				    "LOAD '%s'; CALL flight_sql_start_server(CAST(%d AS USMALLINT))", sql_escape_literal(extension_path),
 				    flight_sql_port);
 				rc = data.RunInitialCommand((char *)fallback_cmd.c_str(), true);
 			} else {
@@ -5246,7 +5246,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv) {
 		while (!seenInterrupt) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
-		(void)data.RunInitialCommand((char *)"CALL stop_flight_sql_server()", false);
+		(void)data.RunInitialCommand((char *)"CALL flight_sql_stop_server()", false);
 		free(azCmd);
 		return 0;
 	}

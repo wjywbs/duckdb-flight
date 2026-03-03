@@ -5,7 +5,7 @@
 require flight
 
 statement ok
-CALL start_flight_sql_server(CAST(0 AS USMALLINT))
+CALL flight_sql_start_server(CAST(0 AS USMALLINT))
 
 query I
 SELECT * FROM flight_sql_is_started()
@@ -13,15 +13,15 @@ SELECT * FROM flight_sql_is_started()
 1
 
 query I
-SELECT length(status) > 0 FROM get_flight_sql_url()
+SELECT length(status) > 0 FROM flight_sql_get_url()
 ----
 1
 
 statement ok
-CALL start_flight_sql_server(CAST(0 AS USMALLINT))
+CALL flight_sql_start_server(CAST(0 AS USMALLINT))
 
 statement ok
-CALL stop_flight_sql_server()
+CALL flight_sql_stop_server()
 
 query I
 SELECT * FROM flight_sql_is_started()
@@ -29,4 +29,4 @@ SELECT * FROM flight_sql_is_started()
 0
 
 statement ok
-CALL stop_flight_sql_server()
+CALL flight_sql_stop_server()

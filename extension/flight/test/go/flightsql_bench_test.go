@@ -1548,11 +1548,11 @@ func TestPreparedStatementTimeoutDatabaseSQL(t *testing.T) {
 
 	// Prepared-handle timeout is configured independently from transaction timeout.
 	var timeoutSet string
-	if err := db.QueryRow("CALL set_flight_sql_prepared_timeout_seconds(1)").Scan(&timeoutSet); err != nil {
+	if err := db.QueryRow("CALL flight_sql_set_prepared_timeout_seconds(1)").Scan(&timeoutSet); err != nil {
 		t.Fatalf("set timeout failed: %v", err)
 	}
 	var timeoutNow int64
-	if err := db.QueryRow("SELECT timeout_seconds FROM get_flight_sql_prepared_timeout_seconds()").Scan(&timeoutNow); err != nil {
+	if err := db.QueryRow("SELECT timeout_seconds FROM flight_sql_get_prepared_timeout_seconds()").Scan(&timeoutNow); err != nil {
 		t.Fatalf("get prepared timeout failed: %v", err)
 	}
 	if timeoutNow != 1 {
@@ -1560,7 +1560,7 @@ func TestPreparedStatementTimeoutDatabaseSQL(t *testing.T) {
 	}
 	defer func() {
 		var timeoutReset string
-		if err := db.QueryRow("CALL set_flight_sql_prepared_timeout_seconds(1800)").Scan(&timeoutReset); err != nil {
+		if err := db.QueryRow("CALL flight_sql_set_prepared_timeout_seconds(1800)").Scan(&timeoutReset); err != nil {
 			t.Fatalf("reset timeout failed: %v", err)
 		}
 	}()

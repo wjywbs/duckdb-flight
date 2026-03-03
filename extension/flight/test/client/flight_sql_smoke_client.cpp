@@ -821,10 +821,10 @@ Status RunMetadata(FlightSqlClient &client) {
 }
 
 Status RunPrepared(FlightSqlClient &client, const Options &options) {
-	const std::string timeout_reset_sql = "CALL set_flight_sql_prepared_timeout_seconds(1800)";
-	const std::string timeout_enable_sql = "CALL set_flight_sql_prepared_timeout_seconds(1)";
-	const std::string sweeper_interval_reset_sql = "CALL set_flight_sql_sweeper_interval_seconds(30)";
-	const std::string sweeper_interval_fast_sql = "CALL set_flight_sql_sweeper_interval_seconds(1)";
+	const std::string timeout_reset_sql = "CALL flight_sql_set_prepared_timeout_seconds(1800)";
+	const std::string timeout_enable_sql = "CALL flight_sql_set_prepared_timeout_seconds(1)";
+	const std::string sweeper_interval_reset_sql = "CALL flight_sql_set_sweeper_interval_seconds(30)";
+	const std::string sweeper_interval_fast_sql = "CALL flight_sql_set_sweeper_interval_seconds(1)";
 	std::vector<std::shared_ptr<PreparedStatement>> statements;
 	std::vector<std::string> raw_handles;
 	auto cleanup = [&]() {
@@ -1307,11 +1307,11 @@ Status RunCancel(FlightSqlClient &client) {
 Status RunTransaction(FlightSqlClient &client) {
 	const std::string create_table_sql = "CREATE TABLE flight_tx_it (id INTEGER, val VARCHAR)";
 	const std::string drop_table_sql = "DROP TABLE IF EXISTS flight_tx_it";
-	const std::string timeout_reset_sql = "CALL set_flight_sql_transaction_timeout_seconds(1800)";
-	const std::string timeout_enable_sql = "CALL set_flight_sql_transaction_timeout_seconds(1)";
-	const std::string timeout_disable_sql = "CALL set_flight_sql_transaction_timeout_seconds(0)";
-	const std::string sweeper_interval_reset_sql = "CALL set_flight_sql_sweeper_interval_seconds(30)";
-	const std::string sweeper_interval_fast_sql = "CALL set_flight_sql_sweeper_interval_seconds(1)";
+	const std::string timeout_reset_sql = "CALL flight_sql_set_transaction_timeout_seconds(1800)";
+	const std::string timeout_enable_sql = "CALL flight_sql_set_transaction_timeout_seconds(1)";
+	const std::string timeout_disable_sql = "CALL flight_sql_set_transaction_timeout_seconds(0)";
+	const std::string sweeper_interval_reset_sql = "CALL flight_sql_set_sweeper_interval_seconds(30)";
+	const std::string sweeper_interval_fast_sql = "CALL flight_sql_set_sweeper_interval_seconds(1)";
 
 	auto cleanup = [&client, &drop_table_sql, &timeout_reset_sql, &sweeper_interval_reset_sql]() {
 		(void)ExecuteUpdate(client, drop_table_sql, std::nullopt);

@@ -126,7 +126,7 @@ public:
 	//! The command to execute when `-ui` is passed in
 	string ui_command = "CALL start_ui()";
 	//! The command prefix to execute when `-flight-sql` is passed in
-	string flight_sql_command = "LOAD flight; CALL start_flight_sql_server";
+	string flight_sql_command = "LOAD flight; CALL flight_sql_start_server";
 
 public:
 	void PushOutputMode();
