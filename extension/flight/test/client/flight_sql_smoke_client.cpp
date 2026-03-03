@@ -1264,13 +1264,14 @@ Status RunCancel(FlightSqlClient &client) {
 	if (worker_result.status.ok() && worker_result.rows_read > expected_rows) {
 		return Status::Invalid("cancel mode query returned more rows than expected");
 	}
-	const bool empty_or_partial_result = worker_result.status.ok() && worker_result.rows_read < expected_rows;
+	const bool empty_or_partial_result = worker_result.rows_read < expected_rows;
 	const bool cancelled_with_error = !worker_result.status.ok() && IsCancellationStatus(worker_result.status);
 	std::cerr << "cancel mode summary: rows_read=" << worker_result.rows_read << " expected_rows=" << expected_rows
 	          << " empty_or_partial=" << (empty_or_partial_result ? "true" : "false")
 	          << " cancelled_with_error=" << (cancelled_with_error ? "true" : "false")
 	          << " query_time_ms=" << worker_result.query_time_ms
 	          << " saw_cancelling_status=" << (saw_cancelling_status ? "true" : "false") << "\n";
+	std::cerr << "cancel mode result_status: " << worker_result.status.ToString() << "\n";
 
 	ARROW_ASSIGN_OR_RAISE(auto control_table, ExecuteQuery(client, "SELECT 1 AS one"));
 	if (control_table->num_columns() != 1 || control_table->num_rows() != 1 || control_table->column(0)->num_chunks() != 1) {
