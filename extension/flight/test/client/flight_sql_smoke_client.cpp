@@ -1181,65 +1181,61 @@ Status RunCancel(FlightSqlClient &client) {
 	constexpr int64_t expected_rows = 500000000;
 	const std::string long_running_query = "SELECT i::BIGINT FROM range(500000000) t(i)";
 
-	ARROW_ASSIGN_OR_RAISE(auto info, client.Execute({}, long_running_query));
-	if (!info || info->endpoints().empty()) {
-		return Status::Invalid("cancel mode query returned no endpoints");
-	}
-	auto ticket = info->endpoints()[0].ticket;
-
 	struct WorkerResult {
 		Status status = Status::Invalid("cancel mode worker did not finish");
 		int64_t rows_read = 0;
 		int64_t query_time_ms = 0;
 	};
-	std::promise<WorkerResult> worker_promise;
-	auto worker_future = worker_promise.get_future();
-	std::thread worker([&]() {
-		WorkerResult result;
-		auto start_time = std::chrono::steady_clock::now();
-		try {
-			auto stream_result = client.DoGet({}, ticket);
-			if (!stream_result.ok()) {
-				result.status = stream_result.status();
-			} else {
-				auto stream = stream_result.MoveValueUnsafe();
-				while (true) {
-					auto chunk_result = stream->Next();
-					if (!chunk_result.ok()) {
-						result.status = chunk_result.status();
-						break;
+	auto run_cancel_scenario = [&](const std::string &scenario, std::unique_ptr<arrow::flight::FlightInfo> info) -> Status {
+		if (!info || info->endpoints().empty()) {
+			return Status::Invalid("cancel mode ", scenario, " query returned no endpoints");
+		}
+		auto ticket = info->endpoints()[0].ticket;
+
+		std::promise<WorkerResult> worker_promise;
+		auto worker_future = worker_promise.get_future();
+		std::thread worker([&]() {
+			WorkerResult result;
+			auto start_time = std::chrono::steady_clock::now();
+			try {
+				auto stream_result = client.DoGet({}, ticket);
+				if (!stream_result.ok()) {
+					result.status = stream_result.status();
+				} else {
+					auto stream = stream_result.MoveValueUnsafe();
+					while (true) {
+						auto chunk_result = stream->Next();
+						if (!chunk_result.ok()) {
+							result.status = chunk_result.status();
+							break;
+						}
+						auto chunk = chunk_result.MoveValueUnsafe();
+						if (!chunk.data) {
+							result.status = Status::OK();
+							break;
+						}
+						result.rows_read += static_cast<int64_t>(chunk.data->num_rows());
 					}
-					auto chunk = chunk_result.MoveValueUnsafe();
-					if (!chunk.data) {
-						result.status = Status::OK();
-						break;
-					}
-					result.rows_read += static_cast<int64_t>(chunk.data->num_rows());
 				}
+			} catch (const std::exception &ex) {
+				result.status = Status::Invalid("cancel mode worker threw exception: ", ex.what());
+			} catch (...) {
+				result.status = Status::Invalid("cancel mode worker threw unknown exception");
 			}
-		} catch (const std::exception &ex) {
-			result.status = Status::Invalid("cancel mode worker threw exception: ", ex.what());
-		} catch (...) {
-			result.status = Status::Invalid("cancel mode worker threw unknown exception");
-		}
-		auto end_time = std::chrono::steady_clock::now();
-		result.query_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-		worker_promise.set_value(std::move(result));
-	});
+			auto end_time = std::chrono::steady_clock::now();
+			result.query_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+			worker_promise.set_value(std::move(result));
+		});
 
-	auto join_worker = [&]() {
-		if (worker.joinable()) {
-			worker.join();
-		}
-	};
+		auto join_worker = [&]() {
+			if (worker.joinable()) {
+				worker.join();
+			}
+		};
 
-	CancelFlightInfoRequest cancel_request(std::move(info));
-	bool saw_cancelling_status = false;
-	std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	for (int attempt = 0; attempt < 6; attempt++) {
-		if (worker_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-			break;
-		}
+		CancelFlightInfoRequest cancel_request(std::move(info));
+		bool saw_cancelling_status = false;
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		auto cancel_result = client.CancelFlightInfo({}, cancel_request);
 		if (!cancel_result.ok()) {
 			join_worker();
@@ -1251,27 +1247,44 @@ Status RunCancel(FlightSqlClient &client) {
 		if (cancel_result->status != CancelStatus::kCancelling && cancel_result->status != CancelStatus::kCancelled &&
 		    cancel_result->status != CancelStatus::kNotCancellable) {
 			join_worker();
-			return Status::Invalid("cancel mode returned unexpected CancelFlightInfo status");
+			return Status::Invalid("cancel mode ", scenario, " returned unexpected CancelFlightInfo status");
 		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(25));
-	}
-	join_worker();
 
-	WorkerResult worker_result = worker_future.get();
-	if (!worker_result.status.ok() && !IsCancellationStatus(worker_result.status)) {
-		return Status::Invalid("cancel mode query failed with non-cancellation status: ", worker_result.status.ToString());
+		join_worker();
+		WorkerResult worker_result = worker_future.get();
+		if (!worker_result.status.ok() && !IsCancellationStatus(worker_result.status)) {
+			return Status::Invalid("cancel mode ", scenario, " query failed with non-cancellation status: ",
+			                      worker_result.status.ToString());
+		}
+		if (worker_result.status.ok() && worker_result.rows_read > expected_rows) {
+			return Status::Invalid("cancel mode ", scenario, " query returned more rows than expected");
+		}
+		const bool empty_or_partial_result = worker_result.rows_read < expected_rows;
+		const bool cancelled_with_error = !worker_result.status.ok() && IsCancellationStatus(worker_result.status);
+		std::cerr << "cancel mode summary [" << scenario << "]: rows_read=" << worker_result.rows_read
+		          << " expected_rows=" << expected_rows
+		          << " empty_or_partial=" << (empty_or_partial_result ? "true" : "false")
+		          << " cancelled_with_error=" << (cancelled_with_error ? "true" : "false")
+		          << " query_time_ms=" << worker_result.query_time_ms
+		          << " saw_cancelling_status=" << (saw_cancelling_status ? "true" : "false") << "\n";
+		std::cerr << "cancel mode result_status [" << scenario << "]: " << worker_result.status.ToString() << "\n";
+		return Status::OK();
+	};
+
+	ARROW_ASSIGN_OR_RAISE(auto statement_info, client.Execute({}, long_running_query));
+	ARROW_RETURN_NOT_OK(run_cancel_scenario("statement", std::move(statement_info)));
+
+	ARROW_ASSIGN_OR_RAISE(auto prepared_stmt, client.Prepare({}, long_running_query));
+	ARROW_ASSIGN_OR_RAISE(auto prepared_info, prepared_stmt->Execute({}));
+	auto prepared_status = run_cancel_scenario("prepared", std::move(prepared_info));
+	auto close_status = prepared_stmt->Close();
+	if (!prepared_status.ok()) {
+		if (!close_status.ok()) {
+			return Status::Invalid(prepared_status.ToString(), " (and prepared close failed: ", close_status.ToString(), ")");
+		}
+		return prepared_status;
 	}
-	if (worker_result.status.ok() && worker_result.rows_read > expected_rows) {
-		return Status::Invalid("cancel mode query returned more rows than expected");
-	}
-	const bool empty_or_partial_result = worker_result.rows_read < expected_rows;
-	const bool cancelled_with_error = !worker_result.status.ok() && IsCancellationStatus(worker_result.status);
-	std::cerr << "cancel mode summary: rows_read=" << worker_result.rows_read << " expected_rows=" << expected_rows
-	          << " empty_or_partial=" << (empty_or_partial_result ? "true" : "false")
-	          << " cancelled_with_error=" << (cancelled_with_error ? "true" : "false")
-	          << " query_time_ms=" << worker_result.query_time_ms
-	          << " saw_cancelling_status=" << (saw_cancelling_status ? "true" : "false") << "\n";
-	std::cerr << "cancel mode result_status: " << worker_result.status.ToString() << "\n";
+	ARROW_RETURN_NOT_OK(close_status);
 
 	ARROW_ASSIGN_OR_RAISE(auto control_table, ExecuteQuery(client, "SELECT 1 AS one"));
 	if (control_table->num_columns() != 1 || control_table->num_rows() != 1 || control_table->column(0)->num_chunks() != 1) {
