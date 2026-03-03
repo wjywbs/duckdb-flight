@@ -8,6 +8,8 @@
 #include <string_view>
 #include <utility>
 
+#include <google/protobuf/any.pb.h>
+
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -19,6 +21,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/flight/sql/server.h"
+#include "arrow/flight/sql/protocol_internal.h"
 #include "arrow/ipc/writer.h"
 
 namespace duckdb {
@@ -27,6 +30,9 @@ namespace flight {
 using arrow::Result;
 using arrow::Schema;
 using arrow::Status;
+using arrow::flight::CancelFlightInfoRequest;
+using arrow::flight::CancelFlightInfoResult;
+using arrow::flight::CancelStatus;
 using arrow::flight::FlightDataStream;
 using arrow::flight::FlightDescriptor;
 using arrow::flight::FlightEndpoint;
@@ -57,6 +63,7 @@ using arrow::flight::sql::SqlSchema;
 using arrow::flight::sql::StatementQuery;
 using arrow::flight::sql::StatementQueryTicket;
 using arrow::flight::sql::StatementUpdate;
+namespace flight_sql_pb = arrow::flight::protocol::sql;
 
 namespace {
 
@@ -367,9 +374,19 @@ struct DuckDBFlightSqlServer::TransactionState {
 	std::unordered_set<uint64_t> owned_prepared_handles;
 	std::shared_mutex mutex;
 	std::atomic<uint64_t> last_activity_ms {0};
+	std::atomic<bool> active_execution {false};
 
 	void UpdateActivityTime() {
 		last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
+	}
+	void MarkExecutionStart() {
+		active_execution.store(true, std::memory_order_relaxed);
+	}
+	void MarkExecutionStop() {
+		active_execution.store(false, std::memory_order_relaxed);
+	}
+	bool IsExecutionActive() const {
+		return active_execution.load(std::memory_order_relaxed);
 	}
 };
 
@@ -382,9 +399,19 @@ struct DuckDBFlightSqlServer::PreparedStatementState {
 	std::optional<uint64_t> transaction_owner;
 	std::shared_mutex mutex;
 	std::atomic<uint64_t> last_activity_ms {0};
+	std::atomic<bool> active_execution {false};
 
 	void UpdateActivityTime() {
 		last_activity_ms.store(CurrentTimeMillis(), std::memory_order_relaxed);
+	}
+	void MarkExecutionStart() {
+		active_execution.store(true, std::memory_order_relaxed);
+	}
+	void MarkExecutionStop() {
+		active_execution.store(false, std::memory_order_relaxed);
+	}
+	bool IsExecutionActive() const {
+		return active_execution.load(std::memory_order_relaxed);
 	}
 };
 
@@ -843,15 +870,26 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetStatement(
 				return Status::Invalid("Statement query does not support parameterized SQL");
 			}
 		}
+		transaction_state->MarkExecutionStart();
 		auto result = state->prepared->Execute(empty_parameters, true);
 		if (!result || result->HasError()) {
+			transaction_state->MarkExecutionStop();
 			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}
 		state->UpdateActivityTime();
 		transaction_state->UpdateActivityTime();
-		ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+		auto stream_result = ResultToFlightStream(std::move(result));
+		if (!stream_result.ok()) {
+			transaction_state->MarkExecutionStop();
+			return stream_result.status();
+		}
+		auto stream = stream_result.MoveValueUnsafe();
+		auto on_close = [transaction_state, cleanup_statement]() {
+			transaction_state->MarkExecutionStop();
+			cleanup_statement();
+		};
 		return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
-		                                                std::shared_ptr<void>(transaction_state), cleanup_statement);
+		                                                std::shared_ptr<void>(transaction_state), on_close);
 	}
 
 	std::unique_lock<std::shared_mutex> state_lock(state->mutex);
@@ -861,14 +899,91 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetStatement(
 	if (!state->ordered_parameters.empty()) {
 		return Status::Invalid("Statement query does not support parameterized SQL");
 	}
+	state->MarkExecutionStart();
 	auto result = state->prepared->Execute(empty_parameters, true);
 	if (!result || result->HasError()) {
+		state->MarkExecutionStop();
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
 	state->UpdateActivityTime();
-	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+	auto stream_result = ResultToFlightStream(std::move(result));
+	if (!stream_result.ok()) {
+		state->MarkExecutionStop();
+		return stream_result.status();
+	}
+	auto stream = stream_result.MoveValueUnsafe();
+	auto on_close = [state, cleanup_statement]() {
+		state->MarkExecutionStop();
+		cleanup_statement();
+	};
 	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(state_lock), std::shared_ptr<void>(state),
-	                                                cleanup_statement);
+	                                                on_close);
+}
+
+Result<CancelFlightInfoResult> DuckDBFlightSqlServer::CancelFlightInfo(const ServerCallContext & /*context*/,
+                                                                        const CancelFlightInfoRequest &request) {
+	auto interrupt_resolved_handle = [this](uint64_t handle_id) -> bool {
+		auto state_lookup = LookupPreparedStatement(handle_id);
+		if (!state_lookup.ok()) {
+			return false;
+		}
+		auto state = state_lookup.MoveValueUnsafe();
+		std::optional<uint64_t> owner_transaction;
+		{
+			std::shared_lock<std::shared_mutex> state_lock(state->mutex);
+			owner_transaction = state->transaction_owner;
+		}
+		if (owner_transaction.has_value()) {
+			auto transaction_lookup = LookupTransaction(owner_transaction.value());
+			if (!transaction_lookup.ok()) {
+				return false;
+			}
+			auto transaction_state = transaction_lookup.MoveValueUnsafe();
+			if (!transaction_state->connection || !transaction_state->IsExecutionActive()) {
+				return false;
+			}
+			transaction_state->connection->Interrupt();
+			return true;
+		}
+		if (!state->connection || !state->IsExecutionActive()) {
+			return false;
+		}
+		state->connection->Interrupt();
+		return true;
+	};
+
+	if (!request.info || request.info->endpoints().empty()) {
+		return CancelFlightInfoResult {CancelStatus::kNotCancellable};
+	}
+
+	const auto &ticket_bytes = request.info->endpoints()[0].ticket.ticket;
+	google::protobuf::Any any;
+	std::optional<uint64_t> handle_id;
+	if (!any.ParseFromArray(ticket_bytes.data(), static_cast<int>(ticket_bytes.size()))) {
+		return Status::Invalid("Invalid CancelFlightInfo ticket encoding");
+	}
+	if (any.Is<flight_sql_pb::TicketStatementQuery>()) {
+		flight_sql_pb::TicketStatementQuery pb_ticket;
+		if (!any.UnpackTo(&pb_ticket)) {
+			return Status::Invalid("Unable to unpack TicketStatementQuery");
+		}
+		ARROW_ASSIGN_OR_RAISE(auto decoded, DecodeStatementTicket(pb_ticket.statement_handle()));
+		handle_id = decoded.statement_id;
+	} else if (any.Is<flight_sql_pb::CommandPreparedStatementQuery>()) {
+		flight_sql_pb::CommandPreparedStatementQuery pb_command;
+		if (!any.UnpackTo(&pb_command)) {
+			return Status::Invalid("Unable to unpack CommandPreparedStatementQuery");
+		}
+		ARROW_ASSIGN_OR_RAISE(auto decoded_handle_id, DecodePreparedHandle(pb_command.prepared_statement_handle()));
+		handle_id = decoded_handle_id;
+	} else {
+		return CancelFlightInfoResult {CancelStatus::kNotCancellable};
+	}
+
+	if (handle_id.has_value() && interrupt_resolved_handle(handle_id.value())) {
+		return CancelFlightInfoResult {CancelStatus::kCancelling};
+	}
+	return CancelFlightInfoResult {CancelStatus::kNotCancellable};
 }
 
 Result<std::unique_ptr<FlightInfo>> DuckDBFlightSqlServer::GetFlightInfoPreparedStatement(
@@ -928,15 +1043,23 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetPreparedSt
 			}
 		}
 
+		transaction_state->MarkExecutionStart();
 		auto result = state->prepared->Execute(named_values, true);
 		if (!result || result->HasError()) {
+			transaction_state->MarkExecutionStop();
 			return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 		}
 		state->UpdateActivityTime();
 		transaction_state->UpdateActivityTime();
-		ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
+		auto stream_result = ResultToFlightStream(std::move(result));
+		if (!stream_result.ok()) {
+			transaction_state->MarkExecutionStop();
+			return stream_result.status();
+		}
+		auto stream = stream_result.MoveValueUnsafe();
+		auto on_close = [transaction_state]() { transaction_state->MarkExecutionStop(); };
 		return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(transaction_lock),
-		                                                std::shared_ptr<void>(transaction_state));
+		                                                std::shared_ptr<void>(transaction_state), on_close);
 	}
 
 	std::unique_lock<std::shared_mutex> state_lock(state->mutex);
@@ -951,14 +1074,23 @@ Result<std::unique_ptr<FlightDataStream>> DuckDBFlightSqlServer::DoGetPreparedSt
 	if (state->query_bound_parameters.has_value()) {
 		named_values = state->query_bound_parameters.value();
 	}
+	state->MarkExecutionStart();
 	auto result = state->prepared->Execute(named_values, true);
 	if (!result || result->HasError()) {
+		state->MarkExecutionStop();
 		return Status::Invalid(result ? result->GetError() : "Unknown DuckDB query failure");
 	}
 
 	state->UpdateActivityTime();
-	ARROW_ASSIGN_OR_RAISE(auto stream, ResultToFlightStream(std::move(result)));
-	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(state_lock), std::shared_ptr<void>(state));
+	auto stream_result = ResultToFlightStream(std::move(result));
+	if (!stream_result.ok()) {
+		state->MarkExecutionStop();
+		return stream_result.status();
+	}
+	auto stream = stream_result.MoveValueUnsafe();
+	auto on_close = [state]() { state->MarkExecutionStop(); };
+	return std::make_unique<LockedFlightDataStream>(std::move(stream), std::move(state_lock), std::shared_ptr<void>(state),
+	                                                on_close);
 }
 
 Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(const ServerCallContext & /*context*/,
