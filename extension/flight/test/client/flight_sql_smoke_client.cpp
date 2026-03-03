@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <optional>
 #include <set>
@@ -22,6 +23,8 @@
 #include "arrow/status.h"
 
 using arrow::Status;
+using arrow::flight::CancelFlightInfoRequest;
+using arrow::flight::CancelStatus;
 using arrow::flight::FlightClient;
 using arrow::flight::Location;
 using arrow::flight::sql::FlightSqlClient;
@@ -39,7 +42,7 @@ struct Options {
 
 void PrintUsage(const char *program_name) {
 	std::cerr << "Usage: " << program_name
-	          << " --host <host> --port <port> --mode <ping|crud|metadata|prepared|transaction|timeout>\n";
+	          << " --host <host> --port <port> --mode <ping|crud|metadata|prepared|transaction|timeout|cancel>\n";
 }
 
 bool ParsePort(const std::string &value, int32_t &port_out) {
@@ -90,8 +93,8 @@ bool ParseArgs(int argc, char **argv, Options &options, std::string &error) {
 		return false;
 	}
 	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata" && options.mode != "prepared" &&
-	    options.mode != "transaction" && options.mode != "timeout") {
-		error = "--mode must be ping, crud, metadata, prepared, transaction or timeout";
+	    options.mode != "transaction" && options.mode != "timeout" && options.mode != "cancel") {
+		error = "--mode must be ping, crud, metadata, prepared, transaction, timeout or cancel";
 		return false;
 	}
 	return true;
@@ -390,6 +393,20 @@ bool IsTimeoutStatus(const Status &status) {
 	       lowered.find("timed out") != std::string::npos || lowered.find("timeout") != std::string::npos ||
 	       lowered.find("context deadline exceeded") != std::string::npos ||
 	       lowered.find("cancelled") != std::string::npos || lowered.find("canceled") != std::string::npos;
+}
+
+bool IsCancellationStatus(const Status &status) {
+	if (status.ok()) {
+		return false;
+	}
+	auto text = status.ToString();
+	std::string lowered;
+	lowered.reserve(text.size());
+	for (auto c : text) {
+		lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+	}
+	return lowered.find("interrupt") != std::string::npos || lowered.find("cancelled") != std::string::npos ||
+	       lowered.find("canceled") != std::string::npos || lowered.find("deadline exceeded") != std::string::npos;
 }
 
 template <class T>
@@ -1160,6 +1177,112 @@ Status RunTimeout(FlightSqlClient &client) {
 	return Status::OK();
 }
 
+Status RunCancel(FlightSqlClient &client) {
+	constexpr int64_t expected_rows = 500000000;
+	const std::string long_running_query = "SELECT i::BIGINT FROM range(500000000) t(i)";
+
+	ARROW_ASSIGN_OR_RAISE(auto info, client.Execute({}, long_running_query));
+	if (!info || info->endpoints().empty()) {
+		return Status::Invalid("cancel mode query returned no endpoints");
+	}
+	auto ticket = info->endpoints()[0].ticket;
+
+	struct WorkerResult {
+		Status status = Status::Invalid("cancel mode worker did not finish");
+		int64_t rows_read = 0;
+		int64_t query_time_ms = 0;
+	};
+	std::promise<WorkerResult> worker_promise;
+	auto worker_future = worker_promise.get_future();
+	std::thread worker([&]() {
+		WorkerResult result;
+		auto start_time = std::chrono::steady_clock::now();
+		try {
+			auto stream_result = client.DoGet({}, ticket);
+			if (!stream_result.ok()) {
+				result.status = stream_result.status();
+			} else {
+				auto stream = stream_result.MoveValueUnsafe();
+				while (true) {
+					auto chunk_result = stream->Next();
+					if (!chunk_result.ok()) {
+						result.status = chunk_result.status();
+						break;
+					}
+					auto chunk = chunk_result.MoveValueUnsafe();
+					if (!chunk.data) {
+						result.status = Status::OK();
+						break;
+					}
+					result.rows_read += static_cast<int64_t>(chunk.data->num_rows());
+				}
+			}
+		} catch (const std::exception &ex) {
+			result.status = Status::Invalid("cancel mode worker threw exception: ", ex.what());
+		} catch (...) {
+			result.status = Status::Invalid("cancel mode worker threw unknown exception");
+		}
+		auto end_time = std::chrono::steady_clock::now();
+		result.query_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+		worker_promise.set_value(std::move(result));
+	});
+
+	auto join_worker = [&]() {
+		if (worker.joinable()) {
+			worker.join();
+		}
+	};
+
+	CancelFlightInfoRequest cancel_request(std::move(info));
+	bool saw_cancelling_status = false;
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	for (int attempt = 0; attempt < 6; attempt++) {
+		if (worker_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+			break;
+		}
+		auto cancel_result = client.CancelFlightInfo({}, cancel_request);
+		if (!cancel_result.ok()) {
+			join_worker();
+			return cancel_result.status();
+		}
+		if (cancel_result->status == CancelStatus::kCancelling || cancel_result->status == CancelStatus::kCancelled) {
+			saw_cancelling_status = true;
+		}
+		if (cancel_result->status != CancelStatus::kCancelling && cancel_result->status != CancelStatus::kCancelled &&
+		    cancel_result->status != CancelStatus::kNotCancellable) {
+			join_worker();
+			return Status::Invalid("cancel mode returned unexpected CancelFlightInfo status");
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+	join_worker();
+
+	WorkerResult worker_result = worker_future.get();
+	if (!worker_result.status.ok() && !IsCancellationStatus(worker_result.status)) {
+		return Status::Invalid("cancel mode query failed with non-cancellation status: ", worker_result.status.ToString());
+	}
+	if (worker_result.status.ok() && worker_result.rows_read > expected_rows) {
+		return Status::Invalid("cancel mode query returned more rows than expected");
+	}
+	const bool empty_or_partial_result = worker_result.status.ok() && worker_result.rows_read < expected_rows;
+	const bool cancelled_with_error = !worker_result.status.ok() && IsCancellationStatus(worker_result.status);
+	std::cerr << "cancel mode summary: rows_read=" << worker_result.rows_read << " expected_rows=" << expected_rows
+	          << " empty_or_partial=" << (empty_or_partial_result ? "true" : "false")
+	          << " cancelled_with_error=" << (cancelled_with_error ? "true" : "false")
+	          << " query_time_ms=" << worker_result.query_time_ms
+	          << " saw_cancelling_status=" << (saw_cancelling_status ? "true" : "false") << "\n";
+
+	ARROW_ASSIGN_OR_RAISE(auto control_table, ExecuteQuery(client, "SELECT 1 AS one"));
+	if (control_table->num_columns() != 1 || control_table->num_rows() != 1 || control_table->column(0)->num_chunks() != 1) {
+		return Status::Invalid("cancel mode control query returned unexpected shape");
+	}
+	ARROW_ASSIGN_OR_RAISE(auto control_value, GetIntValue(control_table->column(0)->chunk(0), 0));
+	if (control_value != 1) {
+		return Status::Invalid("cancel mode control query returned unexpected value: ", control_value);
+	}
+	return Status::OK();
+}
+
 Status RunTransaction(FlightSqlClient &client) {
 	const std::string create_table_sql = "CREATE TABLE flight_tx_it (id INTEGER, val VARCHAR)";
 	const std::string drop_table_sql = "DROP TABLE IF EXISTS flight_tx_it";
@@ -1365,6 +1488,8 @@ Status RunMain(const Options &options) {
 		status = RunTransaction(sql_client);
 	} else if (options.mode == "timeout") {
 		status = RunTimeout(sql_client);
+	} else if (options.mode == "cancel") {
+		status = RunCancel(sql_client);
 	} else {
 		status = RunCrud(sql_client);
 	}
