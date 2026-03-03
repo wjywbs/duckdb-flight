@@ -34,6 +34,7 @@ std::string FlightService::Start(DatabaseInstance &db_instance, uint16_t port) {
 	auto server_instance = std::make_shared<DuckDBFlightSqlServer>(std::move(db_ref));
 	server_instance->SetTransactionTimeoutSeconds(transaction_timeout_seconds.load(std::memory_order_relaxed));
 	server_instance->SetPreparedTimeoutSeconds(prepared_timeout_seconds.load(std::memory_order_relaxed));
+	server_instance->SetSweeperIntervalSeconds(sweeper_interval_seconds.load(std::memory_order_relaxed));
 
 	auto location_result = arrow::flight::Location::ForGrpcTcp("0.0.0.0", static_cast<int>(port));
 	if (!location_result.ok()) {
@@ -141,6 +142,27 @@ int64_t FlightService::GetPreparedTimeoutSeconds() const {
 		return server->GetPreparedTimeoutSeconds();
 	}
 	return prepared_timeout_seconds.load(std::memory_order_relaxed);
+}
+
+std::string FlightService::SetSweeperIntervalSeconds(int64_t interval_seconds) {
+	if (interval_seconds < 1) {
+		throw InvalidInputException("Sweeper interval must be >= 1 second");
+	}
+	std::lock_guard<std::mutex> guard(lock);
+	sweeper_interval_seconds.store(interval_seconds, std::memory_order_relaxed);
+	if (server) {
+		server->SetSweeperIntervalSeconds(interval_seconds);
+	}
+	return StringUtil::Format("Flight SQL sweeper interval set to %lld seconds",
+	                          static_cast<long long>(interval_seconds));
+}
+
+int64_t FlightService::GetSweeperIntervalSeconds() const {
+	std::lock_guard<std::mutex> guard(lock);
+	if (server) {
+		return server->GetSweeperIntervalSeconds();
+	}
+	return sweeper_interval_seconds.load(std::memory_order_relaxed);
 }
 
 bool FlightService::IsStarted() const {

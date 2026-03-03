@@ -125,6 +125,23 @@ static unique_ptr<FunctionData> SetPreparedTimeoutBind(ClientContext &, TableFun
 	return make_uniq<TimeoutBindData>(timeout_seconds);
 }
 
+static unique_ptr<FunctionData> SetSweeperIntervalBind(ClientContext &, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &types, vector<string> &names) {
+	types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("status");
+	if (input.inputs.empty()) {
+		throw InvalidInputException("set_flight_sql_sweeper_interval_seconds(seconds) requires an argument");
+	}
+	if (input.inputs[0].IsNull()) {
+		throw InvalidInputException("Sweeper interval cannot be NULL");
+	}
+	auto interval_seconds = input.inputs[0].GetValue<int64_t>();
+	if (interval_seconds < 1) {
+		throw InvalidInputException("Sweeper interval must be >= 1 second");
+	}
+	return make_uniq<TimeoutBindData>(interval_seconds);
+}
+
 static void StartFlightSQLServerFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	if (!ShouldRun(input)) {
 		return;
@@ -199,6 +216,25 @@ static void GetPreparedTimeoutFunction(ClientContext & /*context*/, TableFunctio
 	output.SetValue(0, 0, Value::BIGINT(timeout_seconds));
 }
 
+static void SetSweeperIntervalFunction(ClientContext & /*context*/, TableFunctionInput &input, DataChunk &output) {
+	if (!ShouldRun(input)) {
+		return;
+	}
+	auto interval_seconds = input.bind_data->Cast<TimeoutBindData>().timeout_seconds;
+	auto status = flight::FlightService::Get().SetSweeperIntervalSeconds(interval_seconds);
+	output.SetCardinality(1);
+	output.SetValue(0, 0, status);
+}
+
+static void GetSweeperIntervalFunction(ClientContext & /*context*/, TableFunctionInput &input, DataChunk &output) {
+	if (!ShouldRun(input)) {
+		return;
+	}
+	auto interval_seconds = flight::FlightService::Get().GetSweeperIntervalSeconds();
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(interval_seconds));
+}
+
 static void RegisterFunctions(ExtensionLoader &loader) {
 	auto start_no_arg =
 	    TableFunction("start_flight_sql_server", {}, StartFlightSQLServerFunction, StartNoArgBind, RunOnceState::Init);
@@ -234,6 +270,14 @@ static void RegisterFunctions(ExtensionLoader &loader) {
 	auto get_prepared_timeout = TableFunction("get_flight_sql_prepared_timeout_seconds", {}, GetPreparedTimeoutFunction,
 	                                          BigIntResultBind, RunOnceState::Init);
 	loader.RegisterFunction(get_prepared_timeout);
+
+	auto set_sweeper_interval = TableFunction("set_flight_sql_sweeper_interval_seconds", {LogicalType::BIGINT},
+	                                          SetSweeperIntervalFunction, SetSweeperIntervalBind, RunOnceState::Init);
+	loader.RegisterFunction(set_sweeper_interval);
+
+	auto get_sweeper_interval = TableFunction("get_flight_sql_sweeper_interval_seconds", {}, GetSweeperIntervalFunction,
+	                                          BigIntResultBind, RunOnceState::Init);
+	loader.RegisterFunction(get_sweeper_interval);
 }
 
 } // namespace

@@ -478,6 +478,15 @@ int64_t DuckDBFlightSqlServer::GetPreparedTimeoutSeconds() const {
 	return prepared_timeout_seconds.load(std::memory_order_relaxed);
 }
 
+void DuckDBFlightSqlServer::SetSweeperIntervalSeconds(int64_t interval_seconds) {
+	sweeper_interval_seconds.store(interval_seconds, std::memory_order_relaxed);
+	sweeper_cv.notify_all();
+}
+
+int64_t DuckDBFlightSqlServer::GetSweeperIntervalSeconds() const {
+	return sweeper_interval_seconds.load(std::memory_order_relaxed);
+}
+
 Result<ActionBeginTransactionResult> DuckDBFlightSqlServer::BeginTransaction(const ServerCallContext & /*context*/,
                                                                              const ActionBeginTransactionRequest & /*request*/) {
 	auto transaction_state = std::make_shared<TransactionState>();
@@ -1421,11 +1430,13 @@ void DuckDBFlightSqlServer::StopTransactionSweeper() {
 
 void DuckDBFlightSqlServer::RunTransactionSweeper() {
 	while (!sweeper_stopping.load(std::memory_order_relaxed)) {
+		auto sweeper_interval_seconds_local = sweeper_interval_seconds.load(std::memory_order_relaxed);
+		if (sweeper_interval_seconds_local < 1) {
+			sweeper_interval_seconds_local = 1;
+		}
 		{
 			std::unique_lock<std::mutex> cv_lock(sweeper_cv_mutex);
-			sweeper_cv.wait_for(cv_lock, std::chrono::seconds(1), [this]() {
-				return sweeper_stopping.load(std::memory_order_relaxed);
-			});
+			sweeper_cv.wait_for(cv_lock, std::chrono::seconds(sweeper_interval_seconds_local));
 		}
 		if (sweeper_stopping.load(std::memory_order_relaxed)) {
 			break;
