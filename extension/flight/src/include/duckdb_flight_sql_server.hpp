@@ -55,6 +55,8 @@ public:
 	    const arrow::flight::FlightDescriptor &descriptor) override;
 	arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>> DoGetStatement(
 	    const arrow::flight::ServerCallContext &context, const arrow::flight::sql::StatementQueryTicket &command) override;
+	arrow::Result<arrow::flight::CancelFlightInfoResult> CancelFlightInfo(
+	    const arrow::flight::ServerCallContext &context, const arrow::flight::CancelFlightInfoRequest &request) override;
 
 	arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetFlightInfoPreparedStatement(
 	    const arrow::flight::ServerCallContext &context, const arrow::flight::sql::PreparedStatementQuery &command,
