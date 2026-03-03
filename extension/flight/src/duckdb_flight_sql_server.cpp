@@ -928,11 +928,9 @@ Result<CancelFlightInfoResult> DuckDBFlightSqlServer::CancelFlightInfo(const Ser
 			return false;
 		}
 		auto state = state_lookup.MoveValueUnsafe();
-		std::optional<uint64_t> owner_transaction;
-		{
-			std::shared_lock<std::shared_mutex> state_lock(state->mutex);
-			owner_transaction = state->transaction_owner;
-		}
+		// Avoid taking state->mutex here: DoGetStatement/DoGetPreparedStatement hold it for the
+		// stream lifetime, and waiting on it would delay cancellation until query completion.
+		auto owner_transaction = state->transaction_owner;
 		if (owner_transaction.has_value()) {
 			auto transaction_lookup = LookupTransaction(owner_transaction.value());
 			if (!transaction_lookup.ok()) {
