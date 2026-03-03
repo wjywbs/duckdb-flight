@@ -823,6 +823,8 @@ Status RunMetadata(FlightSqlClient &client) {
 Status RunPrepared(FlightSqlClient &client, const Options &options) {
 	const std::string timeout_reset_sql = "CALL set_flight_sql_prepared_timeout_seconds(1800)";
 	const std::string timeout_enable_sql = "CALL set_flight_sql_prepared_timeout_seconds(1)";
+	const std::string sweeper_interval_reset_sql = "CALL set_flight_sql_sweeper_interval_seconds(30)";
+	const std::string sweeper_interval_fast_sql = "CALL set_flight_sql_sweeper_interval_seconds(1)";
 	std::vector<std::shared_ptr<PreparedStatement>> statements;
 	std::vector<std::string> raw_handles;
 	auto cleanup = [&]() {
@@ -834,6 +836,7 @@ Status RunPrepared(FlightSqlClient &client, const Options &options) {
 		}
 		(void)ExecuteUpdate(client, "DROP TABLE IF EXISTS flight_prep_it", std::nullopt);
 		(void)ExecuteQuery(client, timeout_reset_sql);
+		(void)ExecuteQuery(client, sweeper_interval_reset_sql);
 	};
 	auto fail_with_cleanup = [&](Status status) {
 		cleanup();
@@ -1124,6 +1127,10 @@ Status RunPrepared(FlightSqlClient &client, const Options &options) {
 	if (!timeout_enable_result || timeout_enable_result->num_rows() != 1) {
 		return fail_with_cleanup(Status::Invalid("failed to set prepared timeout to 1 second"));
 	}
+	ARROW_ASSIGN_OR_RAISE(auto sweeper_interval_fast_result, ExecuteQuery(client, sweeper_interval_fast_sql));
+	if (!sweeper_interval_fast_result || sweeper_interval_fast_result->num_rows() != 1) {
+		return fail_with_cleanup(Status::Invalid("failed to set sweeper interval to 1 second"));
+	}
 	ARROW_ASSIGN_OR_RAISE(auto timeout_handle, CreatePreparedHandleRaw(client, "SELECT 123 AS v"));
 	raw_handles.push_back(timeout_handle);
 	ARROW_ASSIGN_OR_RAISE(auto timeout_before_expiry, GetPreparedFlightInfoRaw(client, timeout_handle));
@@ -1303,10 +1310,13 @@ Status RunTransaction(FlightSqlClient &client) {
 	const std::string timeout_reset_sql = "CALL set_flight_sql_transaction_timeout_seconds(1800)";
 	const std::string timeout_enable_sql = "CALL set_flight_sql_transaction_timeout_seconds(1)";
 	const std::string timeout_disable_sql = "CALL set_flight_sql_transaction_timeout_seconds(0)";
+	const std::string sweeper_interval_reset_sql = "CALL set_flight_sql_sweeper_interval_seconds(30)";
+	const std::string sweeper_interval_fast_sql = "CALL set_flight_sql_sweeper_interval_seconds(1)";
 
-	auto cleanup = [&client, &drop_table_sql, &timeout_reset_sql]() {
+	auto cleanup = [&client, &drop_table_sql, &timeout_reset_sql, &sweeper_interval_reset_sql]() {
 		(void)ExecuteUpdate(client, drop_table_sql, std::nullopt);
 		(void)ExecuteQuery(client, timeout_reset_sql);
+		(void)ExecuteQuery(client, sweeper_interval_reset_sql);
 	};
 	auto fail_with_cleanup = [&](Status status) {
 		cleanup();
@@ -1410,6 +1420,10 @@ Status RunTransaction(FlightSqlClient &client) {
 	ARROW_ASSIGN_OR_RAISE(auto timeout_enable_result, ExecuteQuery(client, timeout_enable_sql));
 	if (!timeout_enable_result || timeout_enable_result->num_rows() != 1) {
 		return fail_with_cleanup(Status::Invalid("failed to set transaction timeout to 1 second"));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto sweeper_interval_fast_result, ExecuteQuery(client, sweeper_interval_fast_sql));
+	if (!sweeper_interval_fast_result || sweeper_interval_fast_result->num_rows() != 1) {
+		return fail_with_cleanup(Status::Invalid("failed to set sweeper interval to 1 second"));
 	}
 
 	ARROW_ASSIGN_OR_RAISE(auto linked_tx, client.BeginTransaction({}));

@@ -22,6 +22,8 @@ public:
 	int64_t GetTransactionTimeoutSeconds() const;
 	std::string SetPreparedTimeoutSeconds(int64_t timeout_seconds);
 	int64_t GetPreparedTimeoutSeconds() const;
+	std::string SetSweeperIntervalSeconds(int64_t interval_seconds);
+	int64_t GetSweeperIntervalSeconds() const;
 	bool IsStarted() const;
 	std::string Location() const;
 
@@ -45,6 +47,10 @@ private:
 	// Start() applies this to new server instances, and GetPreparedTimeoutSeconds()
 	// falls back to this value when no server is active.
 	std::atomic<int64_t> prepared_timeout_seconds {1800};
+	// Stores the desired sweeper interval even when the server is stopped.
+	// Start() applies this to new server instances, and GetSweeperIntervalSeconds()
+	// falls back to this value when no server is active.
+	std::atomic<int64_t> sweeper_interval_seconds {30};
 };
 
 } // namespace flight
