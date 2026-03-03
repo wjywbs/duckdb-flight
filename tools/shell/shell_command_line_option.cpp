@@ -143,7 +143,7 @@ MetadataResult LaunchFlightSQL(ShellState &state, const vector<string> &args) {
 	int rc = 0;
 	if (!extension_path.empty() && lfs.FileExists(extension_path)) {
 		auto fallback_cmd = duckdb::StringUtil::Format(
-		    "LOAD '%s'; CALL start_flight_sql_server(CAST(%d AS USMALLINT))", SQLEscapeLiteral(extension_path),
+		    "LOAD '%s'; CALL flight_sql_start_server(CAST(%d AS USMALLINT))", SQLEscapeLiteral(extension_path),
 		    state.flight_sql_port);
 		rc = state.RunInitialCommand(fallback_cmd.c_str(), true);
 	} else {
@@ -158,7 +158,7 @@ MetadataResult LaunchFlightSQL(ShellState &state, const vector<string> &args) {
 	while (!state.seenInterrupt) {
 		ShellState::Sleep(100);
 	}
-	(void)state.RunInitialCommand("CALL stop_flight_sql_server()", false);
+	(void)state.RunInitialCommand("CALL flight_sql_stop_server()", false);
 	return MetadataResult::EXIT;
 }
 
