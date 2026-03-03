@@ -11,11 +11,17 @@ BUILD_EXTENSIONS='autocomplete;httpfs;icu;json;tpch;flight' GEN=ninja make relea
 ## SQL API
 
 ```sql
-CALL start_flight_sql_server();
-CALL start_flight_sql_server(12345);
-CALL stop_flight_sql_server();
+CALL flight_sql_start_server();
+CALL flight_sql_start_server(12345);
+CALL flight_sql_stop_server();
 SELECT * FROM flight_sql_is_started();
-SELECT * FROM get_flight_sql_url();
+SELECT * FROM flight_sql_get_url();
+CALL flight_sql_set_transaction_timeout_seconds(1800);
+SELECT * FROM flight_sql_get_transaction_timeout_seconds();
+CALL flight_sql_set_prepared_timeout_seconds(1800);
+SELECT * FROM flight_sql_get_prepared_timeout_seconds();
+CALL flight_sql_set_sweeper_interval_seconds(30);
+SELECT * FROM flight_sql_get_sweeper_interval_seconds();
 ```
 
 ## Shell API
