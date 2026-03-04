@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <future>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -42,7 +44,7 @@ struct Options {
 
 void PrintUsage(const char *program_name) {
 	std::cerr << "Usage: " << program_name
-	          << " --host <host> --port <port> --mode <ping|crud|metadata|prepared|transaction|timeout|cancel>\n";
+	          << " --host <host> --port <port> --mode <ping|crud|metadata|prepared|transaction|timeout|cancel|tx-commit-rollback>\n";
 }
 
 bool ParsePort(const std::string &value, int32_t &port_out) {
@@ -57,6 +59,20 @@ bool ParsePort(const std::string &value, int32_t &port_out) {
 	}
 	port_out = static_cast<int32_t>(parsed);
 	return true;
+}
+
+int32_t ParsePositiveEnvOrDefault(const char *name, int32_t default_value) {
+	const char *raw = std::getenv(name);
+	if (!raw || raw[0] == '\0') {
+		return default_value;
+	}
+	char *end_ptr = nullptr;
+	errno = 0;
+	auto parsed = strtoll(raw, &end_ptr, 10);
+	if (errno != 0 || end_ptr == nullptr || *end_ptr != '\0' || parsed <= 0 || parsed > std::numeric_limits<int32_t>::max()) {
+		return default_value;
+	}
+	return static_cast<int32_t>(parsed);
 }
 
 bool ParseArgs(int argc, char **argv, Options &options, std::string &error) {
@@ -93,8 +109,9 @@ bool ParseArgs(int argc, char **argv, Options &options, std::string &error) {
 		return false;
 	}
 	if (options.mode != "ping" && options.mode != "crud" && options.mode != "metadata" && options.mode != "prepared" &&
-	    options.mode != "transaction" && options.mode != "timeout" && options.mode != "cancel") {
-		error = "--mode must be ping, crud, metadata, prepared, transaction, timeout or cancel";
+	    options.mode != "transaction" && options.mode != "timeout" && options.mode != "cancel" &&
+	    options.mode != "tx-commit-rollback") {
+		error = "--mode must be ping, crud, metadata, prepared, transaction, timeout, cancel or tx-commit-rollback";
 		return false;
 	}
 	return true;
@@ -1500,6 +1517,225 @@ Status RunTransaction(FlightSqlClient &client) {
 	return Status::OK();
 }
 
+Status RunTxCommitRollback(FlightSqlClient &client, const Options &options) {
+	const int32_t iterations = ParsePositiveEnvOrDefault("FLIGHT_SQL_CPP_REPRO_ITERS", 20);
+	const int32_t workers = ParsePositiveEnvOrDefault("FLIGHT_SQL_CPP_REPRO_WORKERS", 200);
+	const int32_t rows_per_worker = ParsePositiveEnvOrDefault("FLIGHT_SQL_CPP_REPRO_ROWS_PER_WORKER", 250);
+	const std::string table_name = "go_flight_tx_bench_cpp";
+	const std::string drop_table_sql = "DROP TABLE IF EXISTS " + table_name;
+	const std::string create_table_sql =
+	    "CREATE TABLE " + table_name + " (id BIGINT, worker_id BIGINT, val BIGINT)";
+	const std::string insert_sql = "INSERT INTO " + table_name + " VALUES (?, ?, ?)";
+	const std::string direct_count_sql_prefix =
+	    "SELECT CAST(COUNT(*) AS BIGINT) FROM " + table_name + " WHERE worker_id = ";
+
+	auto cleanup = [&]() { (void)ExecuteUpdate(client, drop_table_sql, std::nullopt); };
+	auto fail_with_cleanup = [&](Status status) {
+		cleanup();
+		return status;
+	};
+
+	auto query_prepared_count = [&](FlightSqlClient &worker_client, int64_t worker_id) -> arrow::Result<int64_t> {
+		ARROW_ASSIGN_OR_RAISE(
+		    auto statement,
+		    worker_client.Prepare({}, "SELECT CAST(COUNT(*) AS BIGINT) FROM go_flight_tx_bench_cpp WHERE worker_id = ?"));
+		auto parameter_schema = statement->parameter_schema();
+		if (!parameter_schema || parameter_schema->num_fields() != 1) {
+			return Status::Invalid("unexpected parameter schema for prepared count query");
+		}
+		ARROW_ASSIGN_OR_RAISE(auto worker_array, BuildIntegerArray(parameter_schema->field(0)->type(), {worker_id}));
+		auto batch =
+		    arrow::RecordBatch::Make(parameter_schema, 1, std::vector<std::shared_ptr<arrow::Array>> {worker_array});
+		ARROW_RETURN_NOT_OK(statement->SetParameters(batch));
+		ARROW_ASSIGN_OR_RAISE(auto info, statement->Execute({}));
+		ARROW_ASSIGN_OR_RAISE(auto table, FlightInfoToTable(worker_client, std::move(info), "prepared worker count"));
+		ARROW_RETURN_NOT_OK(statement->Close());
+		if (table->num_columns() != 1 || table->num_rows() != 1 || table->column(0)->num_chunks() != 1) {
+			return Status::Invalid("prepared count query returned unexpected shape");
+		}
+		return GetIntValue(table->column(0)->chunk(0), 0);
+	};
+
+	std::cerr << "tx-commit-rollback mode config: iterations=" << iterations << " workers=" << workers
+	          << " rows_per_worker=" << rows_per_worker << "\n";
+
+	for (int32_t iter = 1; iter <= iterations; iter++) {
+		ARROW_RETURN_NOT_OK(ExecuteUpdate(client, drop_table_sql, std::nullopt));
+		ARROW_RETURN_NOT_OK(ExecuteUpdate(client, create_table_sql, std::nullopt));
+
+		std::mutex error_mutex;
+		std::vector<std::string> errors;
+		std::vector<std::thread> thread_pool;
+		thread_pool.reserve(static_cast<size_t>(workers));
+
+		for (int32_t worker = 0; worker < workers; worker++) {
+			thread_pool.emplace_back([&, worker]() {
+				auto location_result = Location::ForGrpcTcp(options.host, options.port);
+				if (!location_result.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": location error: " +
+					                 location_result.status().ToString());
+					return;
+				}
+				auto raw_client_result = FlightClient::Connect(location_result.MoveValueUnsafe());
+				if (!raw_client_result.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": connect error: " +
+					                 raw_client_result.status().ToString());
+					return;
+				}
+				FlightSqlClient worker_client(std::move(raw_client_result).MoveValueUnsafe());
+
+				auto tx_result = worker_client.BeginTransaction({});
+				if (!tx_result.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": begin tx error: " +
+					                 tx_result.status().ToString());
+					(void)worker_client.Close();
+					return;
+				}
+				auto tx = tx_result.MoveValueUnsafe();
+
+				auto insert_statement_result = worker_client.Prepare({}, insert_sql, tx);
+				if (!insert_statement_result.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": prepare insert error: " +
+					                 insert_statement_result.status().ToString());
+					(void)worker_client.Rollback({}, tx);
+					(void)worker_client.Close();
+					return;
+				}
+				auto insert_statement = insert_statement_result.MoveValueUnsafe();
+				auto insert_schema = insert_statement->parameter_schema();
+				if (!insert_schema || insert_schema->num_fields() != 3) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) +
+					                 ": unexpected insert parameter schema");
+					(void)insert_statement->Close();
+					(void)worker_client.Rollback({}, tx);
+					(void)worker_client.Close();
+					return;
+				}
+
+				const int64_t base_id = static_cast<int64_t>(worker) * rows_per_worker + 1;
+				for (int32_t i = 0; i < rows_per_worker; i++) {
+					const int64_t id = base_id + i;
+					const int64_t val = id * 10 + worker;
+					auto id_array_result = BuildIntegerArray(insert_schema->field(0)->type(), {id});
+					auto worker_array_result = BuildIntegerArray(insert_schema->field(1)->type(), {worker});
+					auto val_array_result = BuildIntegerArray(insert_schema->field(2)->type(), {val});
+					if (!id_array_result.ok() || !worker_array_result.ok() || !val_array_result.ok()) {
+						std::lock_guard<std::mutex> lock(error_mutex);
+						errors.push_back("worker " + std::to_string(worker) +
+						                 ": failed to build insert parameters");
+						(void)insert_statement->Close();
+						(void)worker_client.Rollback({}, tx);
+						(void)worker_client.Close();
+						return;
+					}
+					auto batch = arrow::RecordBatch::Make(insert_schema, 1,
+					                                      {id_array_result.MoveValueUnsafe(),
+					                                       worker_array_result.MoveValueUnsafe(),
+					                                       val_array_result.MoveValueUnsafe()});
+					auto set_parameters_status = insert_statement->SetParameters(batch);
+					if (!set_parameters_status.ok()) {
+						std::lock_guard<std::mutex> lock(error_mutex);
+						errors.push_back("worker " + std::to_string(worker) + ": set params error: " +
+						                 set_parameters_status.ToString());
+						(void)insert_statement->Close();
+						(void)worker_client.Rollback({}, tx);
+						(void)worker_client.Close();
+						return;
+					}
+					auto update_result = insert_statement->ExecuteUpdate({});
+					if (!update_result.ok() || update_result.ValueOrDie() != 1) {
+						std::lock_guard<std::mutex> lock(error_mutex);
+						errors.push_back("worker " + std::to_string(worker) + ": insert execute error");
+						(void)insert_statement->Close();
+						(void)worker_client.Rollback({}, tx);
+						(void)worker_client.Close();
+						return;
+					}
+				}
+
+				auto close_insert_status = insert_statement->Close();
+				if (!close_insert_status.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": close insert error: " +
+					                 close_insert_status.ToString());
+					(void)worker_client.Rollback({}, tx);
+					(void)worker_client.Close();
+					return;
+				}
+
+				const bool should_commit = (worker % 2) == 0;
+				if (should_commit) {
+					auto commit_status = worker_client.Commit({}, tx);
+					if (!commit_status.ok()) {
+						std::lock_guard<std::mutex> lock(error_mutex);
+						errors.push_back("worker " + std::to_string(worker) + ": commit error: " +
+						                 commit_status.ToString());
+						(void)worker_client.Close();
+						return;
+					}
+				} else {
+					auto rollback_status = worker_client.Rollback({}, tx);
+					if (!rollback_status.ok()) {
+						std::lock_guard<std::mutex> lock(error_mutex);
+						errors.push_back("worker " + std::to_string(worker) + ": rollback error: " +
+						                 rollback_status.ToString());
+						(void)worker_client.Close();
+						return;
+					}
+				}
+
+				const int64_t expected_count = should_commit ? rows_per_worker : 0;
+				auto direct_count_result =
+				    QueryCount(worker_client, direct_count_sql_prefix + std::to_string(worker));
+				if (!direct_count_result.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": direct count error: " +
+					                 direct_count_result.status().ToString());
+					(void)worker_client.Close();
+					return;
+				}
+				auto prepared_count_result = query_prepared_count(worker_client, worker);
+				if (!prepared_count_result.ok()) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + ": prepared count error: " +
+					                 prepared_count_result.status().ToString());
+					(void)worker_client.Close();
+					return;
+				}
+
+				const int64_t direct_count = direct_count_result.MoveValueUnsafe();
+				const int64_t prepared_count = prepared_count_result.MoveValueUnsafe();
+				if (direct_count != expected_count || prepared_count != expected_count) {
+					std::lock_guard<std::mutex> lock(error_mutex);
+					errors.push_back("worker " + std::to_string(worker) + " mismatch direct=" +
+					                 std::to_string(direct_count) + " prepared=" + std::to_string(prepared_count) +
+					                 " expected=" + std::to_string(expected_count) + " commit=" +
+					                 (should_commit ? "true" : "false"));
+				}
+				(void)worker_client.Close();
+			});
+		}
+
+		for (auto &thread : thread_pool) {
+			thread.join();
+		}
+
+		if (!errors.empty()) {
+			return fail_with_cleanup(
+			    Status::Invalid("tx-commit-rollback mode iteration ", iter, " failed: ", errors.front()));
+		}
+		std::cerr << "tx-commit-rollback mode iteration " << iter << "/" << iterations << " passed\n";
+	}
+
+	cleanup();
+	return Status::OK();
+}
+
 Status RunMain(const Options &options) {
 	ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp(options.host, options.port));
 	ARROW_ASSIGN_OR_RAISE(auto client, FlightClient::Connect(location));
@@ -1518,6 +1754,8 @@ Status RunMain(const Options &options) {
 		status = RunTimeout(sql_client);
 	} else if (options.mode == "cancel") {
 		status = RunCancel(sql_client);
+	} else if (options.mode == "tx-commit-rollback") {
+		status = RunTxCommitRollback(sql_client, options);
 	} else {
 		status = RunCrud(sql_client);
 	}
