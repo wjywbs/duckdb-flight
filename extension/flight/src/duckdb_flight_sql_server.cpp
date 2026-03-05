@@ -765,31 +765,18 @@ DuckDBFlightSqlServer::CreateStatementPreparedState(const std::string &query, co
 	state->query_bound_parameters = case_insensitive_map_t<BoundParameterData> {};
 
 	uint64_t statement_id = forced_statement_id.value_or(prepared_statement_counter.fetch_add(1, std::memory_order_relaxed) + 1);
-	std::shared_ptr<PreparedStatementState> mapped_state;
-	bool inserted = false;
 	{
 		std::lock_guard<std::mutex> guard(prepared_statements_mutex);
-		auto entry = prepared_statements.find(statement_id);
-		if (entry == prepared_statements.end()) {
-			prepared_statements.emplace(statement_id, state);
-			mapped_state = state;
-			inserted = true;
-		} else {
-			mapped_state = entry->second;
-		}
+		prepared_statements[statement_id] = state;
 	}
 
-	if (inserted) {
-		state->UpdateActivityTime();
-		if (transaction_state) {
-			transaction_state->owned_prepared_handles.insert(statement_id);
-			transaction_state->UpdateActivityTime();
-		}
-	} else if (transaction_state) {
+	state->UpdateActivityTime();
+	if (transaction_state) {
+		transaction_state->owned_prepared_handles.insert(statement_id);
 		transaction_state->UpdateActivityTime();
 	}
 
-	return std::make_pair(statement_id, mapped_state);
+	return std::make_pair(statement_id, state);
 }
 
 void DuckDBFlightSqlServer::RemoveTransactionOwnedPreparedHandle(uint64_t transaction_id, uint64_t statement_id) {
