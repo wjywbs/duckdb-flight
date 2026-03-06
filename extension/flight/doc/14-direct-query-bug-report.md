@@ -23,6 +23,60 @@ In my case this showed up through Flight SQL because the direct statement path n
 
 But the deeper problem appears to be that a reusable prepared plan can embed snapshot-dependent statistics pruning while the rebind check only invalidates on parameter and catalog-identity changes.
 
+## Minimal Reproducer
+
+I reduced this to a standalone C++ program that only uses `#include "duckdb.hpp"`:
+
+- source:
+  - `extension/flight/test/client/prepared_prune_repro.cpp`
+
+What it does:
+
+1. Create `go_flight_tx_bench`.
+2. Insert 250 rows for `worker_id = 14`.
+3. Prepare:
+
+```sql
+SELECT CAST(COUNT(*) AS BIGINT)
+FROM go_flight_tx_bench
+WHERE worker_id = 14;
+```
+
+4. On another connection, insert and commit 250 rows for `worker_id = 15`.
+5. Execute the prepared statement.
+6. Execute the same SQL fresh on another connection.
+7. Compare the two results.
+
+### Build
+
+From the DuckDB repo root:
+
+```bash
+ninja -C build/release duckdb
+c++ -std=c++17 -Isrc/include \
+  extension/flight/test/client/prepared_prune_repro.cpp \
+  -Lbuild/release/src -lduckdb \
+  -Wl,-rpath,"$PWD/build/release/src" \
+  -ldl -lpthread \
+  -o /tmp/prepared_prune_repro
+```
+
+### Run
+
+```bash
+/tmp/prepared_prune_repro
+```
+
+### Buggy Output
+
+On my build this prints:
+
+```text
+prepared=500 fresh=250 expected=250
+```
+
+The program exits `0` when the mismatch reproduces.
+
 ## Actual Behavior
 
 For a query of the form:
@@ -114,7 +168,7 @@ I also observed the symmetric `FILTER_ALWAYS_TRUE` case, where the pushed-down f
 
 Flight SQL direct statements naturally prepare and execute in separate calls. When there is no pinned transaction handle, those calls land in separate auto-commit transactions. That makes it much easier to hit than in a simple prepare/execute sequence that stays in one transaction context.
 
-I have high confidence the underlying bug is in DuckDB invalidation semantics, even though the current reproducer is through Flight SQL.
+I originally found this through Flight SQL, but the standalone `duckdb.hpp` reproducer above now shows the same issue without Flight.
 
 ## Possible Fix Directions
 
@@ -126,11 +180,12 @@ I have not implemented a fix yet, but the likely directions seem to be:
 
 ## Reproducer Status
 
-Current reproducer:
+Current minimal reproducer:
 
-- Flight SQL direct statement path
-- concurrent workers inserting/committing benchmark rows
-- direct literal query sometimes returns inflated count or empty result
-- parameterized query remains correct
+- standalone C++ program using `duckdb.hpp`
+- no Flight dependency
+- one connection prepares the literal count query
+- another connection commits rows that change the visible worker set
+- stale prepared execution returns a different result than a fresh execution
 
-I have not yet reduced this to a pure non-Flight standalone SQL reproducer, so that is the main missing piece if you want the smallest possible test case.
+The original Flight SQL reproducer still exists and is useful because it exposes both the inflated-count and empty-result variants under heavier concurrency.
