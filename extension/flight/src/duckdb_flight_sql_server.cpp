@@ -1,6 +1,7 @@
 #include "duckdb_flight_sql_server.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -16,6 +17,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 
 #include "arrow/api.h"
@@ -413,6 +415,15 @@ struct DuckDBFlightSqlServer::PreparedStatementState {
 	bool IsExecutionActive() const {
 		return active_execution.load(std::memory_order_relaxed);
 	}
+	void SetAlwaysRebindIfNeeded() {
+		if (transaction_owner.has_value() || !ordered_parameters.empty()) {
+			return;
+		}
+		if (!prepared || !prepared->data) {
+			return;
+		}
+		prepared->data->properties.always_require_rebind = true;
+	}
 };
 
 DuckDBFlightSqlServer::DuckDBFlightSqlServer(shared_ptr<DatabaseInstance> db_instance) : db(std::move(db_instance)) {
@@ -580,6 +591,7 @@ Result<ActionCreatePreparedStatementResult> DuckDBFlightSqlServer::CreatePrepare
 	state->ordered_parameters = std::move(ordered_parameters);
 	state->dataset_schema = dataset_schema;
 	state->query_bound_parameters.reset();
+	state->SetAlwaysRebindIfNeeded();
 
 	auto handle = GeneratePreparedHandle();
 	ARROW_ASSIGN_OR_RAISE(auto handle_id, DecodePreparedHandle(handle));
@@ -763,6 +775,7 @@ DuckDBFlightSqlServer::CreateStatementPreparedState(const std::string &query, co
 	ARROW_ASSIGN_OR_RAISE(state->dataset_schema,
 	                      DuckDBSchemaToArrow(state->prepared->GetTypes(), state->prepared->GetNames(), client_properties));
 	state->query_bound_parameters = case_insensitive_map_t<BoundParameterData> {};
+	state->SetAlwaysRebindIfNeeded();
 
 	uint64_t statement_id = forced_statement_id.value_or(prepared_statement_counter.fetch_add(1, std::memory_order_relaxed) + 1);
 	{

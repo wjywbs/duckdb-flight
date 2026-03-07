@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -23,6 +24,27 @@ func reproIntEnv(name string, defaultValue int) int {
 		return defaultValue
 	}
 	return parsed
+}
+
+func rawBuildTxWorkerInsertSQL(startID, workerID int64, rows int) string {
+	var builder strings.Builder
+	builder.WriteString("INSERT INTO ")
+	builder.WriteString(txBenchmarkTable)
+	builder.WriteString(" VALUES ")
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			builder.WriteString(", ")
+		}
+		id := startID + int64(i)
+		builder.WriteString("(")
+		builder.WriteString(strconv.FormatInt(id, 10))
+		builder.WriteString(", ")
+		builder.WriteString(strconv.FormatInt(workerID, 10))
+		builder.WriteString(", ")
+		builder.WriteString(strconv.FormatInt(expectedVal(id), 10))
+		builder.WriteString(")")
+	}
+	return builder.String()
 }
 
 func runRawReproIteration(t *testing.T, rowsPerWorker, workers int) error {
@@ -303,6 +325,69 @@ func TestRawNonPreparedCountReproducer(t *testing.T) {
 		t.Logf("raw reproducer iteration %d/%d passed", iter, iters)
 	}
 	t.Skipf("raw reproducer did not fail in %d iterations (inconclusive)", iters)
+}
+
+func TestRawPreparedLiteralCountReproducer(t *testing.T) {
+	if !reproEnabled() {
+		t.Skip("set FLIGHTSQL_RUN_REPRO=1 to run reproducer")
+	}
+
+	ctx := context.Background()
+	adminClient := openRawClient(t)
+	defer adminClient.Close()
+
+	if err := rawResetTransactionBenchmarkTable(ctx, adminClient); err != nil {
+		t.Fatalf("reset table failed: %v", err)
+	}
+
+	writerClient, err := newRawClient(ctx)
+	if err != nil {
+		t.Fatalf("new writer client failed: %v", err)
+	}
+	defer writerClient.Close()
+
+	preparedClient, err := newRawClient(ctx)
+	if err != nil {
+		t.Fatalf("new prepared client failed: %v", err)
+	}
+	defer preparedClient.Close()
+
+	freshClient, err := newRawClient(ctx)
+	if err != nil {
+		t.Fatalf("new fresh client failed: %v", err)
+	}
+	defer freshClient.Close()
+
+	if _, err := rawExecuteUpdate(ctx, writerClient, rawBuildTxWorkerInsertSQL(1, 14, 250)); err != nil {
+		t.Fatalf("insert target worker failed: %v", err)
+	}
+
+	const directSQL = "SELECT CAST(COUNT(*) AS BIGINT) FROM " + txBenchmarkTable + " WHERE worker_id = 14"
+	stmt, err := preparedClient.Prepare(ctx, directSQL)
+	if err != nil {
+		t.Fatalf("prepare literal query failed: %v", err)
+	}
+	defer stmt.Close(ctx)
+
+	if _, err := rawExecuteUpdate(ctx, writerClient, rawBuildTxWorkerInsertSQL(251, 15, 250)); err != nil {
+		t.Fatalf("insert other worker failed: %v", err)
+	}
+
+	preparedCount, err := rawExecutePreparedQueryInt64(ctx, preparedClient, stmt, nil)
+	if err != nil {
+		t.Fatalf("execute prepared literal query failed: %v", err)
+	}
+	freshCount, err := rawQueryInt64(ctx, freshClient, directSQL)
+	if err != nil {
+		t.Fatalf("fresh literal query failed: %v", err)
+	}
+
+	if preparedCount != freshCount {
+		t.Fatalf("prepared literal mismatch prepared=%d fresh=%d expected=250", preparedCount, freshCount)
+	}
+	if preparedCount != 250 {
+		t.Fatalf("unexpected prepared literal count=%d expected=250", preparedCount)
+	}
 }
 
 func TestDatabaseSQLCountControl(t *testing.T) {
