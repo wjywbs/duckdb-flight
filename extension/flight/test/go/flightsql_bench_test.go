@@ -787,16 +787,11 @@ func runConcurrentTransactionCreateDropInsertSelect(t *testing.T, db *sql.DB, ro
 				localSum += val
 			}
 
-			// Arrow Go Flight SQL driver v18.5.1 routes zero-arg Tx.QueryContext through
-			// Connection.QueryContext, which currently ignores c.txn. Force parameter binding
-			// so database/sql uses prepared statement path bound to the active transaction.
 			var inTxCountRaw any
 			var inTxSumRaw any
 			if err := tx.QueryRowContext(
 				ctx,
-				"SELECT CAST(COUNT(*) AS BIGINT), CAST(COALESCE(SUM(val), 0) AS BIGINT) FROM "+tableName+
-					" WHERE id >= ?",
-				r.start,
+				"SELECT CAST(COUNT(*) AS BIGINT), CAST(COALESCE(SUM(val), 0) AS BIGINT) FROM "+tableName,
 			).Scan(&inTxCountRaw, &inTxSumRaw); err != nil {
 				_ = tx.Rollback()
 				errCh <- fmt.Errorf("worker=%d in-tx select aggregate failed: %w", worker, err)
